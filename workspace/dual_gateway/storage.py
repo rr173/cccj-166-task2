@@ -109,11 +109,55 @@ CREATE TABLE IF NOT EXISTS events (
     hash      TEXT NOT NULL UNIQUE
 );
 
+-- 事故恢复对账工单：每个“已送达现场但缺终态回报”的目标至多一张。
+-- 唯一约束 (command_id, device_id) 保证重启/重复扫描幂等，不重复建工单。
+CREATE TABLE IF NOT EXISTS recovery_tickets (
+    id              TEXT PRIMARY KEY,
+    command_id      TEXT NOT NULL,
+    device_id       TEXT NOT NULL,
+    status          TEXT NOT NULL,          -- OPEN / RESOLVED
+    reason          TEXT NOT NULL,          -- 挂起原因
+    resolution      TEXT,                   -- 解决方式（处置历史动作）
+    conflict_reason TEXT,                   -- 最近一次冲突原因（隔离材料）
+    evidence        TEXT NOT NULL,          -- JSON 快照：投递代次/时间/窗口/回执
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    resolved_at     REAL,
+    resolved_by     TEXT,
+    UNIQUE (command_id, device_id)
+);
+
+-- 工单处置历史：append-only；CREATE / 系统动作 / 人工动作全部留痕。
+CREATE TABLE IF NOT EXISTS ticket_actions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id   TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    actor       TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    note        TEXT,
+    detail      TEXT NOT NULL               -- JSON
+);
+
+-- 账簿隔离区：编号缺口/矛盾记录/旧代次/指纹不符/断链等材料只隔离、绝不生效。
+-- entry_hash 唯一：重复上传完全相同的坏材料只留一条痕（幂等）。
+CREATE TABLE IF NOT EXISTS ledger_quarantine (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    ticket_id   TEXT,
+    entry_hash  TEXT NOT NULL UNIQUE,
+    reason      TEXT NOT NULL,
+    raw         TEXT NOT NULL,
+    received_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_targets_device ON targets(device_id, status);
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_receipts_device ON receipts(device_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_seq ON receipts(device_id, boot_code, seq);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_tickets_status ON recovery_tickets(status);
+CREATE INDEX IF NOT EXISTS idx_ticket_actions ON ticket_actions(ticket_id, id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_device ON ledger_quarantine(device_id, id);
 """
 
 
@@ -327,14 +371,6 @@ class Storage:
                 "WHERE command_id=? AND status='DISPATCHED'", [(now, i) for i in ids])
         return ids
 
-    def dangling_dispatched(self) -> list[dict]:
-        """重启恢复：所有在途（DISPATCHED）目标——网关已投递但未拿到终态回执。"""
-        rows = self.conn.execute(
-            "SELECT t.command_id,t.device_id,t.dispatched_boot "
-            "FROM targets t JOIN commands c ON c.command_id=t.command_id "
-            "WHERE t.status='DISPATCHED'").fetchall()
-        return [dict(r) for r in rows]
-
     # ---------- 目标 ----------
     def list_targets(self, command_id: str) -> list[dict]:
         rows = self.conn.execute(
@@ -439,6 +475,109 @@ class Storage:
     def list_rejected(self, limit: int = 100) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM rejected_receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- 事故恢复对账工单 ----------
+    def insert_ticket(self, t: dict, now: float) -> bool:
+        """幂等建工单：同 (command_id, device_id) 已存在则不重复建。返回是否新建。"""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO recovery_tickets(id,command_id,device_id,status,"
+            "reason,resolution,conflict_reason,evidence,created_at,updated_at,"
+            "resolved_at,resolved_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (t["id"], t["command_id"], t["device_id"], t["status"], t["reason"],
+             t.get("resolution"), t.get("conflict_reason"),
+             json.dumps(t["evidence"], ensure_ascii=False, sort_keys=True),
+             now, now, t.get("resolved_at"), t.get("resolved_by")))
+        return cur.rowcount == 1
+
+    def get_ticket(self, ticket_id: str) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM recovery_tickets WHERE id=?",
+                                (ticket_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_ticket_for_target(self, command_id: str, device_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM recovery_tickets WHERE command_id=? AND device_id=?",
+            (command_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+    def list_tickets(self, status: str | None = None, limit: int = 200) -> list[dict]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT * FROM recovery_tickets WHERE status=? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?", (status, limit)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM recovery_tickets ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_ticket_action(self, ticket_id: str, ts: float, actor: str,
+                          action: str, detail: dict, note: str | None = None):
+        self.conn.execute(
+            "INSERT INTO ticket_actions(ticket_id,ts,actor,action,note,detail)"
+            " VALUES(?,?,?,?,?,?)",
+            (ticket_id, ts, actor, action, note,
+             json.dumps(detail, ensure_ascii=False, sort_keys=True)))
+
+    def list_ticket_actions(self, ticket_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM ticket_actions WHERE ticket_id=? ORDER BY id",
+            (ticket_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def touch_ticket(self, ticket_id: str, now: float,
+                     conflict_reason: str | None = None):
+        if conflict_reason is None:
+            self.conn.execute(
+                "UPDATE recovery_tickets SET updated_at=? WHERE id=?", (now, ticket_id))
+        else:
+            self.conn.execute(
+                "UPDATE recovery_tickets SET updated_at=?,conflict_reason=? WHERE id=?",
+                (now, conflict_reason, ticket_id))
+
+    def resolve_ticket(self, ticket_id: str, resolution: str, actor: str, now: float):
+        self.conn.execute(
+            "UPDATE recovery_tickets SET status='RESOLVED',resolution=?,"
+            "resolved_by=?,resolved_at=?,updated_at=? WHERE id=?",
+            (resolution, actor, now, now, ticket_id))
+
+    def reopen_ticket(self, ticket_id: str, now: float, conflict_reason: str | None = None):
+        """已结工单被新的既成事实推翻（如 MISSED 后账簿补证已执行）→ 重新挂起。"""
+        self.conn.execute(
+            "UPDATE recovery_tickets SET status='OPEN',resolution=NULL,"
+            "resolved_by=NULL,resolved_at=NULL,updated_at=?,"
+            "conflict_reason=COALESCE(?,conflict_reason) WHERE id=?",
+            (now, conflict_reason, ticket_id))
+
+    def open_doubt_targets(self) -> list[dict]:
+        """重启恢复扫描：已投递但无终态的目标（DISPATCHED 或存量 DOUBT）。"""
+        rows = self.conn.execute(
+            "SELECT t.command_id,t.device_id,t.status,t.dispatched_at,"
+            "t.dispatched_boot FROM targets t "
+            "WHERE t.status IN ('DISPATCHED','DOUBT')").fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- 账簿隔离区 ----------
+    def insert_quarantine(self, device_id: str, ticket_id: str | None,
+                          entry_hash: str, reason: str, raw: Any, now: float) -> bool:
+        """幂等隔离：同一 entry_hash 重复上传只保留首次痕迹。返回是否新增。"""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO ledger_quarantine(device_id,ticket_id,entry_hash,"
+            "reason,raw,received_at) VALUES(?,?,?,?,?,?)",
+            (device_id, ticket_id, entry_hash, reason,
+             json.dumps(raw, ensure_ascii=False, sort_keys=True), now))
+        return cur.rowcount == 1
+
+    def list_quarantine(self, limit: int = 200, device_id: str | None = None) -> list[dict]:
+        if device_id:
+            rows = self.conn.execute(
+                "SELECT * FROM ledger_quarantine WHERE device_id=? "
+                "ORDER BY id DESC LIMIT ?", (device_id, limit)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM ledger_quarantine ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
         return [dict(r) for r in rows]
 
     def commit(self):

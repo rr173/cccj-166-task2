@@ -8,8 +8,12 @@ import unittest
 from dual_gateway.config import load_config
 from dual_gateway.errors import (Conflict, DeviceRejected, FrozenMismatch,
                                  InvalidReceipt, InvalidState, NotFound)
+from dual_gateway.security import (command_fingerprint, ledger_entry_hash,
+                                   sign_ledger_entry)
 from dual_gateway.service import CommandService
 from dual_gateway.storage import Storage
+
+LEDGER_GENESIS = "0" * 64
 
 
 class Clock:
@@ -56,6 +60,31 @@ class ServiceTestBase(unittest.TestCase):
 
     def _receipt(self, dev, boot, seq, cid, result="EXECUTED"):
         return self.svc.receipt(dev, boot, seq, cid, result, "ok")
+
+    def _ledger_entry(self, dev, cid, boot, seq, result="EXECUTED",
+                      digest=None, prev=LEDGER_GENESIS, message="done",
+                      bad_sig=False, fingerprint=None, entry_hash=None,
+                      key=None):
+        """构造一条合法（或可注入篡改的）签名账簿条目。"""
+        if digest is None:
+            cmd = self.db.get_command_row(cid)
+            digest = cmd["digest"] if cmd else None
+        eh = entry_hash if entry_hash is not None else ledger_entry_hash(
+            boot, seq, cid, result, prev)
+        k = key if key is not None else cfg_keys(self.cfg)[dev]
+        sig = "deadbeef" if bad_sig else sign_ledger_entry(k, eh)
+        return {
+            "command_id": cid, "boot_code": boot, "seq": seq,
+            "result": result, "message": message,
+            "prev": prev, "entry_hash": eh,
+            "fingerprint": fingerprint if fingerprint is not None
+            else command_fingerprint(cid, digest),
+            "signature": sig,
+        }
+
+
+def cfg_keys(cfg):
+    return cfg.device_keys
 
 
 class TestCreateConfirm(ServiceTestBase):
@@ -205,13 +234,13 @@ class TestTimeout(ServiceTestBase):
         self._confirm(c)
         self._hello("DEV-A1", "B1")
         self.svc.pull("DEV-A1", "B1")
-        # DEV-A2 一直离线；窗口关闭
+        # DEV-A2 一直离线；窗口关闭：A1 在途无终态→按过期 MISSED，A2 未投递→MISSED
         self.clock.advance(11)
         self.svc.sweep()
         got = self.svc.get_command(c["command_id"])
         statuses = {t["device_id"]: t["status"] for t in got["targets"]}
-        self.assertEqual(statuses["DEV-A1"], "DOUBT")   # 在途等对账
-        self.assertEqual(statuses["DEV-A2"], "MISSED")  # 未投递不补发
+        self.assertEqual(statuses["DEV-A1"], "MISSED")
+        self.assertEqual(statuses["DEV-A2"], "MISSED")
         self.assertEqual(got["status"], "CLOSED")
 
 
@@ -243,9 +272,21 @@ class TestRestartRecovery(ServiceTestBase):
         self._hello("DEV-A1", "B1")
         self.svc.pull("DEV-A1", "B1")
         # 网关重启：startup_recovery 把 DISPATCHED -> DOUBT
-        self.svc.startup_recovery()
+        info = self.svc.startup_recovery()
         t = self.svc.get_command(c["command_id"])["targets"][0]
         self.assertEqual(t["status"], "DOUBT")
+        self.assertEqual(info["tickets"], 1)
+        tk = self.svc.list_recovery_tickets()
+        self.assertEqual(len(tk), 1)
+        self.assertEqual(tk[0]["status"], "OPEN")
+        # 重复执行恢复扫描：幂等，不重复建工单
+        self.svc.startup_recovery()
+        self.assertEqual(len(self.svc.list_recovery_tickets()), 1)
+
+    def test_ticket_not_created_for_never_dispatched(self):
+        self._create(devices=("DEV-A1",))
+        self.svc.startup_recovery()
+        self.assertEqual(self.svc.list_recovery_tickets(), [])
 
     def test_ledger_recovers_executed_fact(self):
         c = self._create(devices=("DEV-A1",))
@@ -253,13 +294,139 @@ class TestRestartRecovery(ServiceTestBase):
         self._hello("DEV-A1", "B1")
         self.svc.pull("DEV-A1", "B1")
         self.svc.startup_recovery()
-        # 设备也重启了（新代号），但账本证明旧代号下已执行
+        # 设备也重启了（新代号），但签名账簿证明旧代号下已执行
         self.svc.hello("DEV-A1", "B2", 1, ledger=[
-            {"command_id": c["command_id"], "boot_code": "B1", "seq": 1,
-             "result": "EXECUTED", "message": "done"}])
+            self._ledger_entry("DEV-A1", c["command_id"], "B1", 1)])
         got = self.svc.get_command(c["command_id"])
         self.assertEqual(got["status"], "EXECUTED")
         self.assertEqual(got["targets"][0]["receipt"]["source"], "LEDGER_RECOVERY")
+        # 工单按事实结案，且结案动作是系统行为
+        tk = self.svc.list_recovery_tickets(status="RESOLVED")[0]
+        self.assertEqual(tk["resolution"], "FACT_RECOVERED")
+        actions = {a["action"] for a in
+                   self.svc.get_recovery_ticket(tk["ticket_id"])["history"]}
+        self.assertIn("CREATED", actions)
+        self.assertIn("FACT_RECOVERED", actions)
+
+    def test_ledger_replay_is_idempotent(self):
+        c = self._create(devices=("DEV-A1",))
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        entry = self._ledger_entry("DEV-A1", c["command_id"], "B1", 1)
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[entry])
+        # 现场重复上传完全相同的账簿：整批从头幂等重放，不产生第二条事实/隔离
+        out = self.svc.hello("DEV-A1", "B2", 1, ledger=[entry, entry])
+        self.assertEqual(out["ledger"]["duplicates"], 2)
+        self.assertEqual(out["ledger"]["recovered"], 0)
+        self.assertEqual(out["ledger"]["quarantined"], [])
+        got = self.svc.get_command(c["command_id"])
+        self.assertEqual(len([t for t in got["targets"] if t["receipt"]]), 1)
+        self.assertEqual(len(self.svc.list_quarantine()), 0)
+        # 再只传一次同样也是 duplicate
+        out = self.svc.hello("DEV-A1", "B2", 1, ledger=[entry])
+        self.assertEqual(out["ledger"]["duplicates"], 1)
+
+    def test_ledger_bad_signature_quarantined_no_state_change(self):
+        c = self._create(devices=("DEV-A1",))
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        bad = self._ledger_entry("DEV-A1", c["command_id"], "B1", 1, bad_sig=True)
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[bad])
+        t = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t["status"], "DOUBT")  # 未执行结论不变
+        self.assertIsNone(t["receipt"])
+        q = self.svc.list_quarantine()
+        self.assertEqual({x["reason"] for x in q}, {"LEDGER_BAD_SIGNATURE"})
+        # 重复上传同一条坏材料：隔离区幂等，只留一条
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[bad])
+        self.assertEqual(len(self.svc.list_quarantine()), 1)
+        tk = self.svc.list_recovery_tickets()[0]
+        self.assertEqual(tk["conflict_reason"], "LEDGER_BAD_SIGNATURE")
+
+    def test_ledger_seq_gap_quarantined(self):
+        c1 = self._create(devices=("DEV-A1",))
+        self._confirm(c1)
+        c2 = self._create(devices=("DEV-A1",))
+        self._confirm(c2)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        # 只上传 c2 的 seq=2（缺口在 seq=1）：缺口隔离；c2 保持 DOUBT 不重投，
+        # c1 没有任何材料，按“重启后未执行”正常重投
+        e2 = self._ledger_entry("DEV-A1", c2["command_id"], "B1", 2)
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[e2])
+        self.assertEqual({x["reason"] for x in self.svc.list_quarantine()},
+                         {"LEDGER_SEQ_GAP"})
+        s1 = self.svc.get_command(c1["command_id"])["targets"][0]["status"]
+        s2 = self.svc.get_command(c2["command_id"])["targets"][0]["status"]
+        self.assertEqual(s1, "PENDING")
+        self.assertEqual(s2, "DOUBT")
+
+    def test_ledger_chain_tamper_quarantined(self):
+        c = self._create(devices=("DEV-A1",))
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        # 自洽签名但 prev 指向伪造前驱（断链）
+        e = self._ledger_entry("DEV-A1", c["command_id"], "B1", 1,
+                               prev="a" * 64)
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[e])
+        reasons = {x["reason"] for x in self.svc.list_quarantine()}
+        self.assertIn("LEDGER_CHAIN_BROKEN", reasons)
+        self.assertIsNone(
+            self.svc.get_command(c["command_id"])["targets"][0]["receipt"])
+
+    def test_ledger_fingerprint_mismatch_quarantined(self):
+        c = self._create(devices=("DEV-A1",))
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        e = self._ledger_entry("DEV-A1", c["command_id"], "B1", 1,
+                               fingerprint="0" * 64)
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[e])
+        self.assertEqual({x["reason"] for x in self.svc.list_quarantine()},
+                         {"LEDGER_FINGERPRINT_MISMATCH"})
+        self.assertEqual(
+            self.svc.get_command(c["command_id"])["targets"][0]["status"], "DOUBT")
+
+    def test_ledger_fact_conflict_quarantined(self):
+        c = self._create(devices=("DEV-A1",))
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self._receipt("DEV-A1", "B1", 1, c["command_id"], "EXECUTED")
+        # 同代次同序号但结果矛盾：矛盾记录隔离，既成事实不动
+        e = self._ledger_entry("DEV-A1", c["command_id"], "B1", 1, "FAILED")
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[e])
+        self.assertEqual({x["reason"] for x in self.svc.list_quarantine()},
+                         {"LEDGER_FACT_CONFLICT"})
+        t = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t["status"], "EXECUTED")
+
+    def test_ledger_old_boot_material_quarantined(self):
+        # 未知（旧代次/伪造）启动代号材料：只隔离留痕
+        self._hello("DEV-A1", "B1")
+        entry = {
+            "command_id": "CMD-X", "boot_code": "BOOT-OLD-GEN", "seq": 1,
+            "result": "EXECUTED", "prev": LEDGER_GENESIS,
+            "entry_hash": ledger_entry_hash(
+                "BOOT-OLD-GEN", 1, "CMD-X", "EXECUTED", LEDGER_GENESIS),
+            "fingerprint": command_fingerprint("CMD-X", None),
+            "signature": sign_ledger_entry(
+                self.cfg.device_keys["DEV-A1"],
+                ledger_entry_hash("BOOT-OLD-GEN", 1, "CMD-X", "EXECUTED",
+                                  LEDGER_GENESIS)),
+        }
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[entry])
+        self.assertEqual({x["reason"] for x in self.svc.list_quarantine()},
+                         {"LEDGER_UNKNOWN_BOOT"})
 
     def test_ledger_absent_after_reboot_redelivers_within_window(self):
         c = self._create(devices=("DEV-A1",))
@@ -273,6 +440,11 @@ class TestRestartRecovery(ServiceTestBase):
         self.assertEqual(t["status"], "PENDING")
         cmds = self.svc.pull("DEV-A1", "B2")["commands"]
         self.assertEqual(len(cmds), 1)
+        # 自动重投在工单历史留痕，工单仍 OPEN（等回执结案）
+        tk = self.svc.list_recovery_tickets(status="OPEN")[0]
+        actions = [a["action"] for a in
+                   self.svc.get_recovery_ticket(tk["ticket_id"])["history"]]
+        self.assertIn("REDELIVER_AFTER_REBOOT", actions)
 
     def test_ledger_absent_after_window_missed_not_executed(self):
         c = self._create(devices=("DEV-A1",), valid_seconds=10)
@@ -285,6 +457,29 @@ class TestRestartRecovery(ServiceTestBase):
         self.svc.hello("DEV-A1", "B2", 1, ledger=[])
         t = self.svc.get_command(c["command_id"])["targets"][0]
         self.assertEqual(t["status"], "MISSED")
+        tk = self.svc.list_recovery_tickets(status="RESOLVED")[0]
+        self.assertEqual(tk["resolution"], "CLOSED_MISSED")
+
+    def test_ledger_after_missed_reopens_and_recovers_fact(self):
+        c = self._create(devices=("DEV-A1",), valid_seconds=10)
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        self.clock.advance(20)
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[])  # 先判 MISSED 结案
+        self.assertEqual(
+            self.svc.get_command(c["command_id"])["targets"][0]["status"], "MISSED")
+        # 之后设备重连同代号旧账，带签名账簿补证当时已执行：事实优先
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[
+            self._ledger_entry("DEV-A1", c["command_id"], "B1", 1)])
+        t = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t["status"], "EXECUTED")
+        tk = self.svc.list_recovery_tickets(status="RESOLVED")[0]
+        self.assertEqual(tk["resolution"], "FACT_RECOVERED")
+        actions = {a["action"] for a in
+                   self.svc.get_recovery_ticket(tk["ticket_id"])["history"]}
+        self.assertIn("FACT_RECOVERED_AFTER_MISSED", actions)
 
     def test_same_boot_doubt_waits_no_redeliver(self):
         c = self._create(devices=("DEV-A1",))
@@ -300,23 +495,127 @@ class TestRestartRecovery(ServiceTestBase):
         self.assertEqual(t["status"], "DOUBT")
 
     def test_fabricated_ledger_ignored(self):
-        # 对从未投递的指令伪造账本：不改任何状态
+        # 对从未投递的指令伪造合法格式签名账簿：不改任何状态，进隔离区
         self._hello("DEV-A1", "B1")
-        self.svc.hello("DEV-A1", "B2", 1, ledger=[
-            {"command_id": "CMD-FAKE", "boot_code": "B1", "seq": 1,
-             "result": "EXECUTED"}])
-        rejected = self.svc.rejected_receipts()
-        self.assertTrue(any(r["reason"] == "LEDGER_NEVER_DISPATCHED" for r in rejected))
+        fake = {
+            "command_id": "CMD-FAKE", "boot_code": "B1", "seq": 1,
+            "result": "EXECUTED", "prev": LEDGER_GENESIS,
+            "entry_hash": ledger_entry_hash(
+                "B1", 1, "CMD-FAKE", "EXECUTED", LEDGER_GENESIS),
+            "fingerprint": command_fingerprint("CMD-FAKE", None),
+            "signature": sign_ledger_entry(
+                self.cfg.device_keys["DEV-A1"],
+                ledger_entry_hash("B1", 1, "CMD-FAKE", "EXECUTED",
+                                  LEDGER_GENESIS)),
+        }
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[fake])
+        self.assertTrue(any(q["reason"] == "LEDGER_NEVER_DISPATCHED"
+                            for q in self.svc.list_quarantine()))
 
     def test_ledger_for_revoked_command_rejected(self):
         c = self._create(devices=("DEV-A1",))
         self.svc.revoke_command("ops", c["command_id"])
         self._hello("DEV-A1", "B1")
         self.svc.hello("DEV-A1", "B2", 1, ledger=[
-            {"command_id": c["command_id"], "boot_code": "B1", "seq": 1,
-             "result": "EXECUTED"}])
+            self._ledger_entry("DEV-A1", c["command_id"], "B1", 1)])
         t = self.svc.get_command(c["command_id"])["targets"][0]
         self.assertEqual(t["status"], "SKIPPED")  # 已撤销事实不被账本翻案
+        self.assertTrue(any(q["reason"].startswith("LEDGER_STATE_FORBIDDEN")
+                            for q in self.svc.list_quarantine()))
+
+
+class TestTicketDisposition(ServiceTestBase):
+    def _open_ticket(self, valid_seconds=100):
+        c = self._create(devices=("DEV-A1",), valid_seconds=valid_seconds)
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")
+        self.svc.startup_recovery()
+        return c, self.svc.list_recovery_tickets()[0]
+
+    def test_note_does_not_change_state(self):
+        c, tk = self._open_ticket()
+        out = self.svc.dispose_ticket("supervisor", tk["ticket_id"],
+                                      "MANUAL_NOTE", "等现场回传")
+        self.assertEqual(out["status"], "OPEN")
+        self.assertEqual(
+            self.svc.get_command(c["command_id"])["targets"][0]["status"], "DOUBT")
+
+    def test_approve_redeliver_within_window(self):
+        c, tk = self._open_ticket()
+        self.svc.dispose_ticket("supervisor", tk["ticket_id"],
+                                "APPROVE_REDELIVER", "人工核实未执行")
+        t = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t["status"], "PENDING")
+        # 工单仍挂起，设备以新代号上线拉取后回执结案
+        self._hello("DEV-A1", "B2")
+        self.svc.pull("DEV-A1", "B2")
+        self._receipt("DEV-A1", "B2", 1, c["command_id"])
+        tk2 = self.svc.get_recovery_ticket(tk["ticket_id"])
+        self.assertEqual(tk2["status"], "RESOLVED")
+        self.assertEqual(tk2["resolution"], "FACT_REPORTED")
+
+    def test_approve_redeliver_after_window_refused(self):
+        c, tk = self._open_ticket(valid_seconds=10)
+        self.clock.advance(20)
+        with self.assertRaises(Conflict):
+            self.svc.dispose_ticket("supervisor", tk["ticket_id"],
+                                    "APPROVE_REDELIVER")
+
+    def test_manual_missed_requires_expired_window(self):
+        c, tk = self._open_ticket()
+        with self.assertRaises(Conflict):
+            self.svc.dispose_ticket("supervisor", tk["ticket_id"], "CLOSED_MISSED")
+        self.clock.advance(120)
+        out = self.svc.dispose_ticket("supervisor", tk["ticket_id"],
+                                      "CLOSED_MISSED", "现场确认未执行且窗口关闭")
+        self.assertEqual(out["status"], "RESOLVED")
+        self.assertEqual(out["resolution"], "CLOSED_MISSED")
+        self.assertEqual(
+            self.svc.get_command(c["command_id"])["targets"][0]["status"], "MISSED")
+
+    def test_human_cannot_overwrite_executed_fact(self):
+        c, tk = self._open_ticket()
+        # 签名账簿补记已执行事实
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[
+            self._ledger_entry("DEV-A1", c["command_id"], "B1", 1)])
+        # 任何人工处置（除备注）都必须被拒绝
+        for act in ("APPROVE_REDELIVER", "CLOSED_MISSED"):
+            with self.assertRaises(Conflict):
+                self.svc.dispose_ticket("supervisor", tk["ticket_id"], act)
+        t = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t["status"], "EXECUTED")
+        self.assertEqual(t["receipt"]["result"], "EXECUTED")
+
+
+class TestWindowTickets(ServiceTestBase):
+    def test_window_close_creates_ticket_for_doubt(self):
+        c = self._create(devices=("DEV-A1", "DEV-A2"), valid_seconds=10)
+        self._confirm(c)
+        self._hello("DEV-A1", "B1")
+        self.svc.pull("DEV-A1", "B1")  # A1 在途；A2 从未上线
+        self.clock.advance(11)
+        self.svc.sweep()
+        # A1：窗口关闭仍无事实→MISSED；事故工单已创建并按过期结案
+        t1 = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t1["status"], "MISSED")
+        tickets = self.svc.list_recovery_tickets()
+        self.assertEqual(len(tickets), 1)  # A1 有事故工单，A2（从未送达）没有
+        self.assertEqual(tickets[0]["device_id"], "DEV-A1")
+        self.assertEqual(tickets[0]["reason"], "WINDOW_CLOSED")
+        self.assertEqual(tickets[0]["status"], "RESOLVED")
+        self.assertEqual(tickets[0]["resolution"], "CLOSED_MISSED")
+        self.assertEqual(
+            self.svc.get_command(c["command_id"])["targets"][1]["status"], "MISSED")
+        # 之后签名账簿补证 A1 当时已执行：事实翻案，工单重开后按事实结案
+        self.svc.hello("DEV-A1", "B2", 1, ledger=[
+            self._ledger_entry("DEV-A1", c["command_id"], "B1", 1)])
+        t1 = self.svc.get_command(c["command_id"])["targets"][0]
+        self.assertEqual(t1["status"], "EXECUTED")
+        tk = self.svc.get_recovery_ticket(tickets[0]["ticket_id"])
+        self.assertEqual(tk["resolution"], "FACT_RECOVERED")
+        self.assertTrue(any(a["action"] == "FACT_RECOVERED_AFTER_MISSED"
+                            for a in tk["history"]))
 
 
 class TestAuditChain(ServiceTestBase):

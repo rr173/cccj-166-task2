@@ -316,9 +316,8 @@ class TestGatewayRestart(E2EBase):
         self.devcall("/api/device/pull", "DEV-A1", {"boot_code": d.boot_code})
 
         # 设备执行了，但在回执送达前网关崩溃
-        d._append_ledger({"command_id": c["command_id"],
-                          "boot_code": d.boot_code, "seq": 1,
-                          "result": "EXECUTED", "message": "done"})
+        d._append_ledger(d.build_ledger_entry(
+            c["command_id"], "EXECUTED", "done", d.boot_code, 1, c["digest"]))
         d.seq = 2
 
         self.restart_gateway()
@@ -415,8 +414,8 @@ class TestDroppedReceipt(E2EBase):
                      {"boot_code": d.boot_code, "first_seq": 1})
         self.devcall("/api/device/pull", "DEV-A1", {"boot_code": d.boot_code})
         # 直接执行（回执被模拟丢弃，账本已落盘）
-        cmds = [x for x in [c]]
-        d.execute_and_report({"command_id": c["command_id"]})
+        d.execute_and_report({"command_id": c["command_id"],
+                              "digest": c["digest"]})
         self.restart_gateway()
         # 设备未重启，同代号 + 账本补记；不会重投，不会双触发
         self.devcall("/api/device/hello", "DEV-A1",
@@ -429,6 +428,133 @@ class TestDroppedReceipt(E2EBase):
                              token=self.cfg.biz_token)
         self.assertEqual(detail["targets"][0]["status"], "EXECUTED")
         self.assertEqual(detail["targets"][0]["receipt"]["source"], "LEDGER_RECOVERY")
+
+
+class TestRecoveryTickets(E2EBase):
+    def _dangling(self, dev_id="DEV-A1", valid_seconds=120):
+        c = self.create(devices=(dev_id,), valid_seconds=valid_seconds)
+        cookie = self.sec_login()
+        self.confirm(c, cookie)
+        d = self.make_device(dev_id, "sim-tkt")
+        self.devcall("/api/device/hello", dev_id,
+                     {"boot_code": d.boot_code, "first_seq": 1})
+        self.devcall("/api/device/pull", dev_id, {"boot_code": d.boot_code})
+        return c, d, cookie
+
+    def _restart_with_open_ticket(self):
+        c, d, cookie = self._dangling()
+        self.restart_gateway()
+        cookie = self.sec_login()  # 重启后内存会话失效，安全设计要求重新登录
+        st, out, _ = _req("GET", self.sec + "/api/tickets?status=OPEN",
+                          cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(out["tickets"]), 1)
+        tid = out["tickets"][0]["ticket_id"]
+        self.assertEqual(out["tickets"][0]["evidence"]["dispatched_boot"],
+                         d.boot_code)
+        return c, d, cookie, tid
+
+    def test_restart_creates_ticket_visible_only_on_security_channel(self):
+        c, d, cookie, tid = self._restart_with_open_ticket()
+        # 未登录拿不到
+        st, _, _ = _req("GET", self.sec + "/api/tickets")
+        self.assertEqual(st, 401)
+        # 业务通道没有工单接口（通道隔离）
+        st, _, _ = _req("GET", f"{self.biz}/api/tickets",
+                        token=self.cfg.biz_token)
+        self.assertEqual(st, 404)
+        # 重复重启不重复建工单
+        self.restart_gateway()
+        cookie = self.sec_login()
+        st, out, _ = _req("GET", self.sec + "/api/tickets?status=OPEN",
+                          cookie=cookie)
+        self.assertEqual(len(out["tickets"]), 1)
+
+    def test_signed_ledger_resolves_ticket_and_idempotent_quarantine(self):
+        c, d, cookie, tid = self._restart_with_open_ticket()
+        # 上传一条坏签名材料：隔离留痕，工单仍 OPEN 且 DOUBT 不重投
+        bad = d.build_ledger_entry(c["command_id"], "EXECUTED", "x",
+                                   d.boot_code, 1, c["digest"])
+        bad["signature"] = "0" * 64
+        st, hello, _ = self.devcall("/api/device/hello", "DEV-A1",
+                                    {"boot_code": d.boot_code, "first_seq": 1,
+                                     "ledger": [bad]})
+        self.assertEqual(hello["ledger"]["quarantined"][0]["reason"],
+                         "LEDGER_BAD_SIGNATURE")
+        # 重复上传同一条坏材料：幂等，隔离区不新增
+        self.devcall("/api/device/hello", "DEV-A1",
+                     {"boot_code": d.boot_code, "first_seq": 1, "ledger": [bad]})
+        st, q, _ = _req("GET", self.sec + "/api/quarantine", cookie=cookie)
+        self.assertEqual(len(q["quarantine"]), 1)
+        # 合法签名账簿补记事实：同一条目重放两次均为幂等 duplicate
+        good = d.build_ledger_entry(c["command_id"], "EXECUTED", "done",
+                                    d.boot_code, 1, c["digest"])
+        st, hello, _ = self.devcall("/api/device/hello", "DEV-A1",
+                                    {"boot_code": d.boot_code, "first_seq": 1,
+                                     "ledger": [good, good]})
+        self.assertEqual(hello["ledger"]["recovered"], 1)
+        self.assertEqual(hello["ledger"]["duplicates"], 1)
+        st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
+                             token=self.cfg.biz_token)
+        self.assertEqual(detail["targets"][0]["status"], "EXECUTED")
+        # 再次重连同一条有效账簿：仍幂等，不产生第二条事实
+        st, hello, _ = self.devcall("/api/device/hello", "DEV-A1",
+                                    {"boot_code": d.boot_code, "first_seq": 1,
+                                     "ledger": [good]})
+        self.assertEqual(hello["ledger"]["recovered"], 0)
+        self.assertEqual(hello["ledger"]["duplicates"], 1)
+        st, tk, _ = _req("GET", f"{self.sec}/api/tickets/{tid}", cookie=cookie)
+        self.assertEqual(tk["status"], "RESOLVED")
+        self.assertEqual(tk["resolution"], "FACT_RECOVERED")
+        actions = [a["action"] for a in tk["history"]]
+        self.assertEqual(actions[0], "CREATED")
+        self.assertIn("LEDGER_CONFLICT", actions)
+        self.assertIn("FACT_RECOVERED", actions)
+        # 既成事实后，任何人工处置都不能覆盖
+        for act in ("APPROVE_REDELIVER", "CLOSED_MISSED"):
+            st, out, _ = _req("POST", f"{self.sec}/api/tickets/{tid}/dispose",
+                              cookie=cookie, body={"action": act})
+            self.assertEqual(st, 409, out)
+
+    def test_readonly_safety_cannot_dispose(self):
+        c, d, cookie, tid = self._restart_with_open_ticket()
+        ro = self.sec_login("safety")
+        st, out, _ = _req("POST", f"{self.sec}/api/tickets/{tid}/dispose",
+                          cookie=ro, body={"action": "MANUAL_NOTE", "note": "x"})
+        self.assertEqual(st, 403)
+        # 只读账号仍可查看证据与处置历史
+        st, tk, _ = _req("GET", f"{self.sec}/api/tickets/{tid}", cookie=ro)
+        self.assertEqual(st, 200)
+        self.assertIn("history", tk)
+
+    def test_human_missed_only_after_window_and_never_marks_executed(self):
+        c, d, cookie = self._dangling(valid_seconds=2)
+        self.restart_gateway()
+        cookie = self.sec_login()
+        st, out, _ = _req("GET", self.sec + "/api/tickets?status=OPEN",
+                          cookie=cookie)
+        tid = out["tickets"][0]["ticket_id"]
+        # 窗口仍有效时人工定 MISSED 被拒
+        st, out, _ = _req("POST", f"{self.sec}/api/tickets/{tid}/dispose",
+                          cookie=cookie, body={"action": "CLOSED_MISSED"})
+        self.assertEqual(st, 409)
+        # 等待窗口关闭：系统自动按过期定 MISSED 并结案
+        time.sleep(2.4)
+        st, tk, _ = _req("GET", f"{self.sec}/api/tickets/{tid}", cookie=cookie)
+        self.assertEqual(tk["status"], "RESOLVED")
+        self.assertEqual(tk["resolution"], "CLOSED_MISSED")
+        st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
+                             token=self.cfg.biz_token)
+        self.assertEqual(detail["targets"][0]["status"], "MISSED")
+        self.assertIsNone(detail["targets"][0]["receipt"])
+        # 备注仍可追加，但任何重投/改判都不能复活已结工单
+        st, out, _ = _req("POST", f"{self.sec}/api/tickets/{tid}/dispose",
+                          cookie=cookie, body={"action": "MANUAL_NOTE",
+                                               "note": "归档"})
+        self.assertEqual(st, 200)
+        st, out, _ = _req("POST", f"{self.sec}/api/tickets/{tid}/dispose",
+                          cookie=cookie, body={"action": "APPROVE_REDELIVER"})
+        self.assertEqual(st, 409)
 
 
 if __name__ == "__main__":

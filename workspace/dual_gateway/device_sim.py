@@ -21,7 +21,10 @@ import os
 import threading
 import time
 
-from .security import hmac_sign, new_boot_code
+from .security import (command_fingerprint, hmac_sign, ledger_entry_hash,
+                       new_boot_code, sign_ledger_entry)
+
+LEDGER_GENESIS = "0" * 64
 
 try:
     import urllib.request
@@ -48,6 +51,8 @@ class SimDevice:
         self.verbose = verbose
         self.boot_code = new_boot_code()
         self.seq = 1
+        # 代次内哈希链链头：按 boot_code 维护，重启后从账本重建
+        self.ledger_tips: dict[str, str] = {}
         self.online = False
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -66,9 +71,28 @@ class SimDevice:
             for line in f:
                 line = line.strip()
                 if line:
-                    self.executed.append(json.loads(line))
+                    e = json.loads(line)
+                    self.executed.append(e)
+                    # 重建各代次链头；当前代次序号顺延
+                    self.ledger_tips[e["boot_code"]] = e.get(
+                        "entry_hash", LEDGER_GENESIS)
+                    if e["boot_code"] == self.boot_code:
+                        self.seq = max(self.seq, int(e["seq"]) + 1)
         if self.executed:
             self.log(f"加载本地执行账本 {len(self.executed)} 条（跨重启保留）")
+
+    def build_ledger_entry(self, command_id: str, result: str, message: str,
+                           boot_code: str, seq: int, digest: str | None) -> dict:
+        """构造一条带签名、指令指纹、代次内哈希链的执行账簿条目。"""
+        prev = self.ledger_tips.get(boot_code, LEDGER_GENESIS)
+        eh = ledger_entry_hash(boot_code, seq, command_id, result, prev)
+        return {
+            "command_id": command_id, "boot_code": boot_code, "seq": seq,
+            "result": result, "message": message,
+            "prev": prev, "entry_hash": eh,
+            "fingerprint": command_fingerprint(command_id, digest),
+            "signature": sign_ledger_entry(self.key, eh),
+        }
 
     def _append_ledger(self, entry: dict):
         with open(self.ledger_path, "a", encoding="utf-8") as f:
@@ -76,6 +100,7 @@ class SimDevice:
             f.flush()
             os.fsync(f.fileno())
         self.executed.append(entry)
+        self.ledger_tips[entry["boot_code"]] = entry["entry_hash"]
 
     # ---------- HTTP ----------
     def _post(self, path: str, payload: dict):
@@ -114,16 +139,16 @@ class SimDevice:
             "result": result, "message": message})
 
     def execute_and_report(self, cmd: dict) -> tuple[str, dict]:
-        """本地执行 + 先落账本再回执。返回 (回执行为描述, 响应)。"""
+        """本地执行 + 先落签名账本再回执。返回 (回执行为描述, 响应)。"""
         import random
         with self._lock:
             result = "FAILED" if random.random() < self.fail_rate else "EXECUTED"
             seq = self.seq
             boot = self.boot_code
-            entry = {"command_id": cmd["command_id"], "boot_code": boot,
-                     "seq": seq, "result": result,
-                     "message": "simulated actuation"}
-            # 1) 执行事实先持久化（关键：先落盘后回执）
+            # 1) 执行事实先持久化（关键：先落盘后回执）；条目带签名/指纹/链
+            entry = self.build_ledger_entry(
+                cmd["command_id"], result, "simulated actuation",
+                boot, seq, cmd.get("digest"))
             self._append_ledger(entry)
             self.seq += 1
 

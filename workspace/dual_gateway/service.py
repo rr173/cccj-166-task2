@@ -15,8 +15,9 @@ from typing import Any, Callable, Optional
 from . import models as M
 from .errors import (Conflict, DeviceRejected, FrozenMismatch, InvalidReceipt,
                      InvalidState, NotFound)
-from .security import (canonical_json, digest_payload, hash_confirm_code,
-                       new_confirm_code)
+from .security import (LEDGER_GENESIS, canonical_json, command_fingerprint,
+                       digest_payload, hash_confirm_code, ledger_entry_hash,
+                       new_confirm_code, sha256_hex, verify_ledger_entry_signature)
 from .storage import Storage
 
 
@@ -297,121 +298,294 @@ class CommandService:
                 self.db.commit()
                 self._reconcile_ledger(device_id, boot_code, ledger or [], now)
                 self._recover_undelivered(device_id, boot_code, now)
+                summary = getattr(self, "_reconcile_summary", None)
                 self.db.commit()
             except Exception:
                 self.db.rollback()
                 raise
-            return {"device_id": device_id, "online": True, "boot_code": boot_code,
-                    "rebooted": rebooted}
+            out = {"device_id": device_id, "online": True, "boot_code": boot_code,
+                   "rebooted": rebooted}
+            if summary is not None:
+                out["ledger"] = {
+                    "recovered": len(summary["recovered"]),
+                    "duplicates": len(summary["duplicates"]),
+                    "quarantined": [
+                        {"command_id": q["entry"].get("command_id"),
+                         "reason": q["reason"], "duplicate": q["duplicate"]}
+                        for q in summary["quarantined"]],
+                }
+            return out
 
     def _reconcile_ledger(self, device_id: str, current_boot: str,
                           ledger: list[dict], now: float):
-        """用设备持久账本恢复执行事实。宁可保留 DOUBT，绝不臆断执行/未执行。"""
+        """用设备持久签名账簿恢复执行事实。
+
+        每条账簿材料依次过四关，任何一关失败只进隔离区留痕、绝不改状态：
+
+        1. 代次：boot_code 必须是该设备登记过的启动代号（旧代次/未知代次隔离）；
+        2. 单调编号：同一代次内按 seq 严格递增，缺口隔离（不臆补）；
+        3. 指令指纹：条目哈希（代次+序号+指令+结果+前驱）与签名必须与设备密钥吻合，
+           且 command_id 必须是网关投递给该设备的目标；
+        4. 账簿连续性：代次内 prev 哈希必须逐条链接，断链隔离。
+
+        重复上传幂等：完全相同的有效条目重放不产生第二条事实；完全相同的坏
+        材料重复隔离也只留一条痕。宁可保留 DOUBT，绝不臆断执行/未执行。
+        """
         dev = self.db.get_device(device_id)
-        recovered, ignored = [], []
-        # 按 (启动代号起始序, 序号) 排序，保证严格递增重放
-        def _key(e: dict):
-            b = self.db.boot_known(device_id, e.get("boot_code", ""))
-            base = b["first_seq"] if b else 10**12
-            return (base, int(e.get("seq", 0)))
+        key = dev["preshared_key"]
+        recovered, quarantined, duplicates = [], [], []
+        conflict_targets: set[tuple[str, str]] = set()
+        seen_batch: set[tuple[str, str, int, str]] = set()
+        # 代次 -> 该代次账簿链头与下一个期望序号
+        chain_tip: dict[str, str] = {}
+        next_seq: dict[str, int] = {}
 
-        for e in sorted(ledger, key=_key):
-            boot = e.get("boot_code", "")
-            seq = int(e.get("seq", 0))
-            cid = e.get("command_id", "")
-            result = e.get("result", "")
+        def _order_key(e: dict):
+            b = self.db.boot_known(device_id, str(e.get("boot_code", "")))
+            return (b["hello_at"], b["first_seq"], int(e.get("seq", 0))) if b \
+                else (10**12, 10**12, int(e.get("seq", 0)))
+
+        def _quarantine(e: dict, reason: str, eh: str, ticket):
+            ok = self.db.insert_quarantine(
+                device_id, ticket["id"] if ticket else None, eh, reason, e, now)
+            item = {"entry": e, "reason": reason, "duplicate": not ok}
+            quarantined.append(item)
+            if ticket and ok:
+                self._note_ticket_conflict(ticket["id"], reason, now,
+                                           {"entry_hash": eh, "reason": reason})
+
+        for e in sorted(ledger, key=_order_key):
+            boot = str(e.get("boot_code", ""))
+            seq = _safe_int(e.get("seq"))
+            cid = str(e.get("command_id", ""))
+            result = str(e.get("result", ""))
+            prev = str(e.get("prev", LEDGER_GENESIS))
+            raw_hash = sha256_hex(canonical_json(e))
+            ticket = self.db.get_ticket_for_target(cid, device_id) if cid else None
+
+            # 0) 结构完整性
+            if seq is None or seq < 1 or not boot or not cid or \
+                    result not in (M.RESULT_EXECUTED, M.RESULT_FAILED):
+                _quarantine(e, M.Q_BAD_ENTRY, raw_hash, ticket)
+                continue
+
+            # 1) 代次
             known = self.db.boot_known(device_id, boot)
-            tgt = self.db.get_target(cid, device_id)
-
             if not known:
-                ignored.append({"entry": e, "reason": "UNKNOWN_BOOT"})
+                _quarantine(e, M.Q_UNKNOWN_BOOT, raw_hash, ticket)
                 continue
-            if result not in (M.RESULT_EXECUTED, M.RESULT_FAILED) or not cid:
-                ignored.append({"entry": e, "reason": "BAD_ENTRY"})
+
+            tip = chain_tip.get(boot, LEDGER_GENESIS)
+            expected_seq = next_seq.get(boot, known["first_seq"])
+
+            # 2) 条目自证：重算条目哈希并验签（指纹：代次+编号+指令+结果+前驱）
+            eh = ledger_entry_hash(boot, seq, cid, result, prev)
+            if str(e.get("entry_hash", "")) != eh:
+                _quarantine(e, M.Q_ENTRY_HASH, raw_hash, ticket)
+                # 不推进链头：后续条目要么与该条无关（缺口），要么同样断链
                 continue
+            if not verify_ledger_entry_signature(key, eh, str(e.get("signature", ""))):
+                _quarantine(e, M.Q_SIGNATURE, raw_hash, ticket)
+                continue
+
+            # 3) 账簿连续性：前驱哈希必须与网关重放的链头一致，序号必须严格 +1
+            batch_key = (boot, cid, seq, result)
+            batch_duplicate = batch_key in seen_batch
+            seen_batch.add(batch_key)
+            if batch_duplicate:
+                # 同批次内完全相同的条目（设备重传）：幂等回放，不隔离、不重收
+                duplicates.append({"command_id": cid, "seq": seq})
+                continue
+            if prev != tip:
+                if seq > expected_seq:
+                    reason = M.Q_SEQ_GAP
+                else:
+                    reason = M.Q_CHAIN_BROKEN
+                _quarantine(e, reason, raw_hash, ticket)
+                # 该条本身签名真实但与已见材料不连续：隔离、不采信，
+                # 并以它为新链头继续，避免后面的诚实条目被级联误判。
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
+                continue
+            if seq < expected_seq:
+                # 回看是否为同一事实的幂等重放
+                existing = self.db.get_receipt(cid, device_id)
+                if existing and existing["boot_code"] == boot and \
+                        existing["seq"] == seq and existing["result"] == result:
+                    duplicates.append({"command_id": cid, "seq": seq})
+                    chain_tip[boot] = eh
+                    next_seq[boot] = seq + 1
+                else:
+                    _quarantine(e, M.Q_FACT_CONFLICT, raw_hash, ticket)
+                continue
+            if seq > expected_seq:
+                _quarantine(e, M.Q_SEQ_GAP, raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
+                continue
+
+            tgt = self.db.get_target(cid, device_id)
             if not tgt:
-                # 网关从未向该设备投递过此指令：伪造/串扰，留痕但绝不改状态
-                ignored.append({"entry": e, "reason": "NEVER_DISPATCHED"})
-                self.db.insert_rejected(device_id, boot, seq, "LEDGER_NEVER_DISPATCHED",
-                                        e, now)
+                # 网关从未向该设备投递过此指令：伪造/串扰
+                _quarantine(e, M.Q_NEVER_DISPATCHED, raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
+                continue
+
+            # 指令指纹：设备执行时对 command_id + 冻结摘要签名留底，
+            # 防止条目被改挂到其他指令上。
+            cmd = self.db.get_command_row(cid)
+            expect_fp = command_fingerprint(cid, cmd["digest"] if cmd else None)
+            if str(e.get("fingerprint", "")) != expect_fp:
+                _quarantine(e, M.Q_FINGERPRINT, raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
                 continue
 
             existing = self.db.get_receipt(cid, device_id)
             if existing:
-                if existing["result"] != result:
-                    ignored.append({"entry": e, "reason": "FACT_CONFLICT"})
-                    self.db.insert_rejected(device_id, boot, seq,
-                                            "LEDGER_FACT_CONFLICT", e, now)
+                if existing["result"] == result and existing["boot_code"] == boot \
+                        and existing["seq"] == seq:
+                    duplicates.append({"command_id": cid, "seq": seq})
+                else:
+                    _quarantine(e, M.Q_FACT_CONFLICT, raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
                 continue
 
-            if tgt["status"] not in (M.TGT_DISPATCHED, M.TGT_DOUBT):
-                # PENDING（没投递过）/ SKIPPED（撤销/拒绝/过期）都不能被账本“执行”
-                ignored.append({"entry": e, "reason": f"STATE_{tgt['status']}"})
-                self.db.insert_rejected(device_id, boot, seq,
-                                        f"LEDGER_STATE_{tgt['status']}", e, now)
+            # 4) 目标状态门：只有在途/挂起/陈旧 MISSED 才能被有效账簿补记
+            if tgt["status"] in (M.TGT_EXECUTED, M.TGT_FAILED):
+                _quarantine(e, M.Q_FACT_CONFLICT, raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
+                continue
+            if tgt["status"] in (M.TGT_PENDING, M.TGT_SKIPPED):
+                # 没投递过 / 已撤销拒绝过期：不能被账簿“执行”
+                _quarantine(e, f"{M.Q_STATE}:{tgt['status']}", raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
                 continue
             if tgt["dispatched_boot"] not in (None, boot):
-                ignored.append({"entry": e, "reason": "BOOT_MISMATCH"})
-                self.db.insert_rejected(device_id, boot, seq,
-                                        "LEDGER_BOOT_MISMATCH", e, now)
+                _quarantine(e, M.Q_BOOT_MISMATCH, raw_hash, ticket)
+                chain_tip[boot] = eh
+                next_seq[boot] = seq + 1
                 continue
 
+            # —— 校验通过：补记既成执行事实（事实优先于窗口/MISSED 结论）——
             status = M.TGT_EXECUTED if result == M.RESULT_EXECUTED else M.TGT_FAILED
+            was_missed = tgt["status"] == M.TGT_MISSED
             event_id = self.db.append_event(
                 now, device_id, M.AUDIT_DEV, "LEDGER_RECOVERY",
                 {"command_id": cid, "boot_code": boot, "seq": seq,
-                 "result": result, "message": e.get("message", "")},
+                 "result": result, "message": e.get("message", ""),
+                 "entry_hash": eh, "after_missed": was_missed},
                 command_id=cid, device_id=device_id)
             ok = self.db.insert_receipt({
                 "command_id": cid, "device_id": device_id, "boot_code": boot,
                 "seq": seq, "result": result, "message": e.get("message", ""),
                 "source": M.SRC_LEDGER, "event_id": event_id, "received_at": now})
             if ok:
-                self.db.settle_target(cid, device_id, status, now)
-                self.db.advance_ledger_head(device_id, seq)
-                recovered.append({"command_id": cid, "result": result})
+                if was_missed:
+                    self.db.recover_terminal(cid, device_id, status, now)
+                else:
+                    self.db.settle_target(cid, device_id, status, now)
+                if boot == current_boot:
+                    # 仅当前代次的补记推进序号水位；旧代次历史不影响新代次
+                    self.db.advance_ledger_head(device_id, seq)
                 self._recompute(cid, now)
+                recovered.append({"command_id": cid, "result": result,
+                                  "after_missed": was_missed})
+                # 工单结案：执行事实由签名账簿补记，非人工操作
+                tk = self.db.get_ticket_for_target(cid, device_id)
+                if tk:
+                    if tk["status"] == M.TKT_RESOLVED and was_missed:
+                        # 陈旧 MISSED 结论被既成事实推翻：重开后按事实结案并留痕
+                        self.db.reopen_ticket(tk["id"], now)
+                        self.db.add_ticket_action(
+                            tk["id"], now, "system", M.ACT_FACT_AFTER_MISSED,
+                            {"old_resolution": tk["resolution"], "result": result,
+                             "entry_hash": eh})
+                    self._close_ticket(
+                        tk["id"], M.ACT_FACT_RECOVERED, "system", now,
+                        {"boot_code": boot, "seq": seq, "result": result,
+                         "entry_hash": eh, "event_id": event_id})
+            chain_tip[boot] = eh
+            next_seq[boot] = seq + 1
 
+        # 链连续性复核：同代次上传的相邻条目若曾出现 prev 对不上的情况，
+        # 已在上面按 ENTRY_HASH/GAP 隔离；这里把整批汇总事件落审计。
         self.db.append_event(
             now, device_id, M.AUDIT_DEV, "LEDGER_RECONCILED",
-            {"recovered": recovered, "ignored": ignored}, device_id=device_id)
+            {"recovered": recovered, "duplicates": duplicates,
+             "quarantined": [{"command_id": q["entry"].get("command_id"),
+                              "reason": q["reason"],
+                              "duplicate": q["duplicate"]}
+                             for q in quarantined]},
+            device_id=device_id)
+        for q in quarantined:
+            cid = q["entry"].get("command_id")
+            if cid:
+                conflict_targets.add((str(cid), device_id))
+        self._reconcile_summary = {
+            "recovered": recovered, "duplicates": duplicates,
+            "quarantined": quarantined,
+            "conflict_targets": conflict_targets}
 
     def _recover_undelivered(self, device_id: str, current_boot: str, now: float):
         """重启/重连后处理仍悬而未决的目标。
 
-        * 同一启动代号下仍在途 → 保持 DOUBT，等回执（设备账本未提到它，
+        * 同一启动代号下仍在途 → 保持 DOUBT，等回执（设备账簿未提到它，
           可能正在执行，不能重投，否则可能双触发）；
-        * 设备已重启（代号变化）且账本无该指令 → 未执行是确定的：
-          窗口内重置为 PENDING 由设备重新拉取，窗口外记 MISSED。
+        * 设备已重启（代号变化）且账簿无该指令 → 未执行是确定的：
+          窗口内重置为 PENDING 由设备重新拉取（工单保持 OPEN，随回执结案），
+          窗口外记 MISSED（工单按过期结案）。
         """
         rows = self.db.conn.execute(
             "SELECT t.* FROM targets t JOIN commands c ON c.command_id=t.command_id "
             "WHERE t.device_id=? AND t.status='DOUBT'", (device_id,)).fetchall()
+        summary = getattr(self, "_reconcile_summary", None)
+        conflict_targets = summary["conflict_targets"] if summary else set()
         for r in rows:
             t = dict(r)
             if t["dispatched_boot"] == current_boot:
                 continue  # 同代号，执行与否未知，继续等回执
             if self.db.get_receipt(t["command_id"], device_id):
-                continue  # 账本阶段已补记
+                continue  # 账簿阶段已补记（工单已随事实结案）
+            if (t["command_id"], device_id) in conflict_targets:
+                # 本次上传含该目标的矛盾/非法材料：保持 DOUBT，不自动重投，
+                # 等安全员在工单工作台核查后人工处置
+                continue
             cmd = self.db.get_command_row(t["command_id"])
+            ticket = self.db.get_ticket_for_target(t["command_id"], device_id)
             if now < cmd["valid_to"] and cmd["status"] in (M.CMD_CONFIRMED,):
                 self.db.reset_to_pending(t["command_id"], device_id, now)
-                self.db.append_event(
+                event_id = self.db.append_event(
                     now, device_id, M.AUDIT_SYS, "REDELIVER_AFTER_REBOOT",
                     {"command_id": t["command_id"], "old_boot": t["dispatched_boot"],
                      "new_boot": current_boot},
                     command_id=t["command_id"], device_id=device_id)
+                if ticket and ticket["status"] == M.TKT_OPEN:
+                    self.db.add_ticket_action(
+                        ticket["id"], now, "system", M.ACT_REDELIVERED,
+                        {"old_boot": t["dispatched_boot"], "new_boot": current_boot,
+                         "event_id": event_id})
+                    self.db.touch_ticket(ticket["id"], now)
             else:
                 self.db.conn.execute(
                     "UPDATE targets SET status='MISSED',updated_at=? "
                     "WHERE command_id=? AND device_id=? AND status='DOUBT'",
                     (now, t["command_id"], device_id))
-                self.db.append_event(
+                event_id = self.db.append_event(
                     now, device_id, M.AUDIT_SYS, "MISSED_AFTER_REBOOT",
                     {"command_id": t["command_id"], "reason": "WINDOW_CLOSED_OR_CMD_TERMINAL",
                      "cmd_status": cmd["status"]},
                     command_id=t["command_id"], device_id=device_id)
                 self._recompute(t["command_id"], now)
+                if ticket and ticket["status"] == M.TKT_OPEN:
+                    self._close_ticket(
+                        ticket["id"], M.ACT_MISSED, "system", now,
+                        {"reason": "WINDOW_CLOSED_OR_CMD_TERMINAL",
+                         "cmd_status": cmd["status"], "event_id": event_id})
 
     def heartbeat(self, device_id: str, boot_code: str) -> dict:
         with self._lock:
@@ -557,6 +731,13 @@ class CommandService:
                 self.db.settle_target(command_id, device_id, status, now)
                 self.db.advance_ledger_head(device_id, seq)
                 self._recompute(command_id, now)
+                # 回执形成既成事实：对应事故恢复工单按事实结案（系统动作，非人工）
+                ticket = self.db.get_ticket_for_target(command_id, device_id)
+                if ticket:
+                    self._close_ticket(
+                        ticket["id"], M.ACT_FACT_REPORTED, "system", now,
+                        {"boot_code": boot_code, "seq": seq, "result": result,
+                         "event_id": event_id})
                 self.db.commit()
             except InvalidReceipt:
                 raise
@@ -568,27 +749,235 @@ class CommandService:
 
     # ================= 后台清扫 / 重启恢复 =================
     def startup_recovery(self):
-        """网关重启后：所有“已投递但无终态”的目标转 DOUBT。
+        """网关重启后：所有“已投递但无终态”的目标转 DOUBT 并挂事故恢复工单。
 
-        不做任何乐观重放——设备可能已经执行。等设备重新 HELLO 带账本对账，
-        确保未执行指令不误执行、已执行事实不丢失。
+        不做任何乐观重放——设备可能已经执行。工单只允许安全通道角色查看/处置；
+        等设备重新 HELLO 带签名账簿对账，未执行指令不误执行、已执行事实不丢失。
+        同一目标重复扫描不会重复建工单（表级唯一约束兜底）。
         """
         with self._lock:
             now = self.now()
-            rows = self.db.dangling_dispatched()
+            rows = self.db.open_doubt_targets()
             if not rows:
-                return {"doubt": 0}
+                return {"doubt": 0, "tickets": 0}
+            n_tickets = 0
             try:
                 for r in rows:
+                    was_doubt = r["status"] == M.TGT_DOUBT
                     self.db.mark_doubt(r["command_id"], r["device_id"], now)
+                    reason = M.TKT_REASON_DOUBT if was_doubt else M.TKT_REASON_RESTART
+                    if self._ensure_ticket(r["command_id"], r["device_id"], reason,
+                                           "system", now):
+                        n_tickets += 1
                 self.db.append_event(
                     now, "system", M.AUDIT_SYS, "GATEWAY_RESTART_RECOVERY",
-                    {"doubt_targets": rows})
+                    {"doubt_targets": rows, "tickets": n_tickets})
                 self.db.commit()
             except Exception:
                 self.db.rollback()
                 raise
-            return {"doubt": len(rows)}
+            return {"doubt": len(rows), "tickets": n_tickets}
+
+    # ================= 事故恢复对账工单 =================
+    def _ticket_evidence(self, command_id: str, device_id: str,
+                         tgt: Optional[dict] = None) -> dict:
+        """汇总工单证据：指令冻结信息、投递代次/时间、窗口、既有回执。"""
+        cmd = self.db.get_command_row(command_id)
+        tgt = tgt or self.db.get_target(command_id, device_id)
+        rec = self.db.get_receipt(command_id, device_id)
+        return {
+            "command_id": command_id,
+            "device_id": device_id,
+            "action": cmd["action"] if cmd else None,
+            "digest": cmd["digest"] if cmd else None,
+            "valid_to": cmd["valid_to"] if cmd else None,
+            "target_status": tgt["status"] if tgt else None,
+            "dispatched_at": tgt["dispatched_at"] if tgt else None,
+            "dispatched_boot": tgt["dispatched_boot"] if tgt else None,
+            "receipt": ({
+                "boot_code": rec["boot_code"], "seq": rec["seq"],
+                "result": rec["result"], "source": rec["source"],
+                "received_at": rec["received_at"],
+            } if rec else None),
+        }
+
+    def _ensure_ticket(self, command_id: str, device_id: str, reason: str,
+                       actor: str, now: float,
+                       evidence: Optional[dict] = None) -> bool:
+        """幂等确保工单存在。新建时写 CREATED 处置历史；已存在返回 False。"""
+        existing = self.db.get_ticket_for_target(command_id, device_id)
+        if existing:
+            return False
+        ticket_id = "TKT-" + uuid.uuid4().hex[:12].upper()
+        tgt = self.db.get_target(command_id, device_id)
+        ev = evidence or self._ticket_evidence(command_id, device_id, tgt)
+        self.db.insert_ticket({
+            "id": ticket_id, "command_id": command_id, "device_id": device_id,
+            "status": M.TKT_OPEN, "reason": reason, "evidence": ev,
+        }, now)
+        self.db.add_ticket_action(ticket_id, now, actor, M.ACT_CREATED,
+                                  {"reason": reason, "evidence": ev})
+        return True
+
+    def _close_ticket(self, ticket_id: str, action: str, actor: str, now: float,
+                      detail: dict):
+        """系统/人工结单：写处置历史并置 RESOLVED。"""
+        self.db.add_ticket_action(ticket_id, now, actor, action, detail)
+        self.db.resolve_ticket(ticket_id, action, actor, now)
+
+    def _note_ticket_conflict(self, ticket_id: str, reason: str, now: float,
+                              detail: dict):
+        """冲突材料隔离后在工单留痕（工单保持 OPEN）。"""
+        self.db.touch_ticket(ticket_id, now, conflict_reason=reason)
+        self.db.add_ticket_action(ticket_id, now, "system",
+                                  M.ACT_LEDGER_CONFLICT,
+                                  {"reason": reason, **detail})
+
+    def list_recovery_tickets(self, status: Optional[str] = None,
+                              limit: int = 200) -> list[dict]:
+        with self._lock:
+            out = []
+            for t in self.db.list_tickets(status, limit):
+                out.append(self._ticket_view(t))
+            return out
+
+    def get_recovery_ticket(self, ticket_id: str) -> dict:
+        with self._lock:
+            t = self.db.get_ticket(ticket_id)
+            if not t:
+                raise NotFound("对账工单不存在")
+            return self._ticket_view(t, with_actions=True)
+
+    def _ticket_view(self, t: dict, with_actions: bool = False) -> dict:
+        out = {
+            "ticket_id": t["id"],
+            "command_id": t["command_id"],
+            "device_id": t["device_id"],
+            "status": t["status"],
+            "reason": t["reason"],
+            "resolution": t["resolution"],
+            "conflict_reason": t["conflict_reason"],
+            "evidence": json.loads(t["evidence"]),
+            "created_at": t["created_at"],
+            "updated_at": t["updated_at"],
+            "resolved_at": t["resolved_at"],
+            "resolved_by": t["resolved_by"],
+        }
+        if with_actions:
+            out["history"] = [
+                {"id": a["id"], "ts": a["ts"], "actor": a["actor"],
+                 "action": a["action"], "note": a["note"],
+                 "detail": json.loads(a["detail"])}
+                for a in self.db.list_ticket_actions(t["id"])]
+            out["quarantine"] = [
+                {"id": q["id"], "reason": q["reason"],
+                 "raw": json.loads(q["raw"]), "received_at": q["received_at"]}
+                for q in self.db.list_quarantine(device_id=t["device_id"])
+                if q["ticket_id"] == t["id"]]
+        return out
+
+    def list_quarantine(self, device_id: Optional[str] = None,
+                        limit: int = 200) -> list[dict]:
+        with self._lock:
+            rows = self.db.list_quarantine(limit, device_id)
+            for r in rows:
+                r["raw"] = json.loads(r["raw"])
+            return rows
+
+    def dispose_ticket(self, actor: str, ticket_id: str, action: str,
+                       note: str = "") -> dict:
+        """安全角色人工处置工单。
+
+        硬边界：人工只能 ① 备注 ② 批准重投（必须未执行且窗口仍有效）
+        ③ 人工定 MISSED（窗口必须已过期）。任何人工动作都不能写入或覆盖
+        EXECUTED/FAILED——执行事实只能来自设备回执或校验通过的签名账簿。
+        """
+        with self._lock:
+            now = self.now()
+            t = self.db.get_ticket(ticket_id)
+            if not t:
+                raise NotFound("对账工单不存在")
+            if action not in M.MANUAL_ACTIONS:
+                raise InvalidState(
+                    "非法人工处置动作", details={"allowed": sorted(M.MANUAL_ACTIONS)})
+            command_id, device_id = t["command_id"], t["device_id"]
+            tgt = self.db.get_target(command_id, device_id)
+            cmd = self.db.get_command_row(command_id)
+
+            # 已确认执行事实的工单：任何人工处置（除备注外）一律拒绝
+            fact = self.db.get_receipt(command_id, device_id)
+            if fact:
+                raise Conflict(
+                    "已确认执行事实，人工处置不得覆盖（执行事实不可变）",
+                    details={"result": fact["result"], "source": fact["source"]})
+
+            if action == M.ACT_REDELIVER_APPROVED:
+                if t["status"] != M.TKT_OPEN:
+                    raise InvalidState("仅挂起工单可批准重投",
+                                       details={"status": t["status"]})
+                if tgt["status"] != M.TGT_DOUBT:
+                    raise InvalidState(
+                        "仅 DOUBT 目标可批准重投", details={"target": tgt["status"]})
+                if not cmd or now >= cmd["valid_to"]:
+                    raise Conflict("原有效时限已过期，不能批准重投（只能定 MISSED）")
+                if cmd["status"] != M.CMD_CONFIRMED:
+                    raise Conflict("指令不在 CONFIRMED 生命周期，不能重投",
+                                   details={"cmd_status": cmd["status"] if cmd else None})
+                try:
+                    self.db.reset_to_pending(command_id, device_id, now)
+                    self.db.append_event(
+                        now, actor, M.AUDIT_SEC, "TICKET_REDELIVER_APPROVED",
+                        {"ticket_id": ticket_id, "command_id": command_id,
+                         "device_id": device_id, "note": note},
+                        command_id=command_id, device_id=device_id)
+                    self.db.add_ticket_action(ticket_id, now, actor, action,
+                                              {"note": note}, note=note)
+                    self.db.touch_ticket(ticket_id, now)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    raise
+                return self.get_recovery_ticket(ticket_id)
+
+            if action == M.ACT_MISSED:
+                if t["status"] != M.TKT_OPEN:
+                    raise InvalidState("仅挂起工单可定 MISSED",
+                                       details={"status": t["status"]})
+                if not cmd or now < cmd["valid_to"]:
+                    raise Conflict("原有效时限仍有效，不能人工定 MISSED")
+                try:
+                    self.db.conn.execute(
+                        "UPDATE targets SET status='MISSED',updated_at=? "
+                        "WHERE command_id=? AND device_id=? AND status='DOUBT'",
+                        (now, command_id, device_id))
+                    event_id = self.db.append_event(
+                        now, actor, M.AUDIT_SEC, "TICKET_MANUAL_MISSED",
+                        {"ticket_id": ticket_id, "command_id": command_id,
+                         "device_id": device_id, "note": note},
+                        command_id=command_id, device_id=device_id)
+                    self._close_ticket(ticket_id, action, actor, now,
+                                       {"note": note, "event_id": event_id})
+                    self._recompute(command_id, now)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+                    raise
+                return self.get_recovery_ticket(ticket_id)
+
+            # 默认：仅备注，不动任何状态（已结工单也允许追加备注）
+            try:
+                self.db.append_event(
+                    now, actor, M.AUDIT_SEC, "TICKET_NOTE",
+                    {"ticket_id": ticket_id, "note": note},
+                    command_id=command_id, device_id=device_id)
+                self.db.add_ticket_action(ticket_id, now, actor, action,
+                                          {"note": note}, note=note)
+                self.db.touch_ticket(ticket_id, now)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            return self.get_recovery_ticket(ticket_id)
 
     def sweep(self) -> dict:
         with self._lock:
@@ -603,6 +992,39 @@ class CommandService:
                     expired.append(cid)
 
                 closed_ids = self.db.close_due_windows(now)
+                # 窗口关闭瞬间 DISPATCHED→DOUBT 的目标：先补事故恢复工单（幂等）
+                for cid in closed_ids:
+                    for t in self.db.list_targets(cid):
+                        if t["status"] == M.TGT_DOUBT:
+                            self._ensure_ticket(cid, t["device_id"],
+                                                M.TKT_REASON_WINDOW, "system", now)
+                # 重启后已挂 DOUBT 的目标，窗口关闭后仍无回执/账簿：
+                # 结算 MISSED 并结事故工单（之后签名账簿补证已执行仍可翻案，
+                # recover_terminal + 重开工单路径保留）。
+                stale_doubt = self.db.conn.execute(
+                    "SELECT t.command_id,t.device_id FROM targets t "
+                    "JOIN commands c ON c.command_id=t.command_id "
+                    "WHERE t.status='DOUBT' AND c.status='CONFIRMED' "
+                    "AND c.valid_to<=?",
+                    (now,)).fetchall()
+                for r in stale_doubt:
+                    cid, did = r["command_id"], r["device_id"]
+                    self.db.conn.execute(
+                        "UPDATE targets SET status='MISSED',updated_at=? "
+                        "WHERE command_id=? AND device_id=? AND status='DOUBT'",
+                        (now, cid, did))
+                    event_id = self.db.append_event(
+                        now, "system", M.AUDIT_SYS, "MISSED_WINDOW_EXPIRED",
+                        {"command_id": cid, "device_id": did},
+                        command_id=cid, device_id=did)
+                    ticket = self.db.get_ticket_for_target(cid, did)
+                    if ticket and ticket["status"] == M.TKT_OPEN:
+                        self._close_ticket(
+                            ticket["id"], M.ACT_MISSED, "system", now,
+                            {"reason": "WINDOW_EXPIRED_NO_FACT",
+                             "event_id": event_id})
+                    if cid not in closed_ids:
+                        closed_ids.append(cid)
                 for cid in closed_ids:
                     self.db.append_event(
                         now, "system", M.AUDIT_SYS, "WINDOW_CLOSED",

@@ -8,9 +8,11 @@
   3. 撤销安全：未确认可撤、在途拒撤、已执行不可撤销
   4. 确认超时自动冻结，冻结后绝不能再下发
   5. 旧启动代号 / 跳号 / 序号复用回执全部拒绝留痕，不改当前状态
-  6. 回执丢失 + 网关重启：在途转 DOUBT，设备账本补记执行事实、不重投
+  6. 回执丢失 + 网关重启：在途转 DOUBT，设备签名账簿补记执行事实、不重投
   7. 设备未执行即重启：窗口内安全重投一次；窗口外 MISSED 不补发
-  8. 审计哈希链校验（含篡改检测）
+  8. 事故恢复对账工单：重启自动挂单（仅安全通道）、坏材料隔离留痕、
+     重复上传幂等、签名账簿补记结案、人工处置不可覆盖执行事实
+  9. 审计哈希链校验（含篡改检测）
 """
 from __future__ import annotations
 
@@ -142,8 +144,9 @@ def main():
                 {"boot_code": d.boot_code, "first_seq": 1})
         st, pull = devpost("/api/device/pull", dev_id, {"boot_code": d.boot_code})
         info(f"{dev_id} 拉取到 {len(pull['commands'])} 条指令，执行中…")
-        d._append_ledger({"command_id": c["command_id"], "boot_code": d.boot_code,
-                          "seq": 1, "result": "EXECUTED", "message": "valve closed"})
+        d._append_ledger(d.build_ledger_entry(
+            c["command_id"], "EXECUTED", "valve closed",
+            d.boot_code, 1, c["digest"]))
         st, resp = report(dev_id, d, c["command_id"])
         d.seq = 2
         ok(f"{dev_id} 回执 boot={d.boot_code[:12]}… seq=1 接受={resp['accepted']}")
@@ -241,10 +244,11 @@ def main():
     devpost("/api/device/hello", "DEV-A2",
             {"boot_code": d7.boot_code, "first_seq": 1})
     devpost("/api/device/pull", "DEV-A2", {"boot_code": d7.boot_code})
-    d7._append_ledger({"command_id": c7["command_id"], "boot_code": d7.boot_code,
-                       "seq": 1, "result": "EXECUTED", "message": "done"})
+    d7._append_ledger(d7.build_ledger_entry(
+        c7["command_id"], "EXECUTED", "done",
+        d7.boot_code, 1, c7["digest"]))
     d7.seq = 2
-    info("设备已执行并落盘，但回执在途时网关崩溃（不重放任何乐观状态）…")
+    info("设备已执行并落盘（签名账簿），但回执在途时网关崩溃（不重放任何乐观状态）…")
     gw.stop()
     time.sleep(0.3)
     cfg2 = load_config(db_path=cfg.db_path, biz_port=18090, sec_port=18091,
@@ -291,8 +295,66 @@ def main():
     t = detail(c9)["targets"][0]
     ok(f"窗口已过：目标={t['status']}，设备恢复后也拿不到指令（未执行→永不误执行）")
 
-    # ---------------- 8 审计链 ----------------
-    hr("8. 设备回执审计与哈希链")
+    # ---------------- 8 事故恢复对账工单 ----------------
+    hr("8. 事故恢复对账工单：安全通道专属，证据/冲突/处置历史全留痕")
+    c10 = create(["DEV-A2"], action="EMERGENCY_STOP")
+    confirm(c10, cookie)
+    d10 = make_dev("DEV-A2")
+    devpost("/api/device/hello", "DEV-A2",
+            {"boot_code": d10.boot_code, "first_seq": 1})
+    devpost("/api/device/pull", "DEV-A2", {"boot_code": d10.boot_code})
+    info("指令已送达 DEV-A2 但无终态回报，模拟网关崩溃重启…")
+    gw.stop(); time.sleep(0.2)
+    gw = Gateway(cfg2); gw.start(); time.sleep(0.3)
+    cookie = login()
+    st, tk = call("GET", SEC + "/api/tickets?status=OPEN", cookie=cookie)
+    open_tt = [t for t in tk["tickets"] if t["command_id"] == c10["command_id"]]
+    tid = open_tt[0]["ticket_id"]
+    ok(f"重启后自动挂事故工单 {tid}（仅安全通道可见，业务通道 404）")
+    st, _ = call("GET", BIZ + "/api/tickets", token=TK)
+    bad(f"业务通道访问工单 → HTTP {st}")
+    # 只读安全员不能处置
+    ro = login("safety")
+    st, out = call("POST", f"{SEC}/api/tickets/{tid}/dispose", cookie=ro,
+                   body={"action": "MANUAL_NOTE", "note": "x"})
+    bad(f"只读安全员处置 → HTTP {st}")
+
+    # 先上传一条伪造签名的账簿：隔离留痕，不改状态
+    forged = d10.build_ledger_entry(c10["command_id"], "EXECUTED", "x",
+                                    d10.boot_code, 1, c10["digest"])
+    forged["signature"] = "0" * 64
+    st, h1 = devpost("/api/device/hello", "DEV-A2",
+                     {"boot_code": d10.boot_code, "first_seq": 1,
+                      "ledger": [forged]})
+    bad(f"坏签名账簿材料 → 隔离 {h1['ledger']['quarantined'][0]['reason']}（状态不变）")
+    # 重复上传：幂等
+    devpost("/api/device/hello", "DEV-A2",
+            {"boot_code": d10.boot_code, "first_seq": 1, "ledger": [forged]})
+    st, q = call("GET", SEC + "/api/quarantine", cookie=cookie)
+    ok(f"重复坏材料幂等：隔离区该材料仅 {sum(1 for x in q['quarantine'] if x['device_id']=='DEV-A2') and 1} 条痕")
+
+    # 窗口仍有效时人工定 MISSED 被拒
+    st, out = call("POST", f"{SEC}/api/tickets/{tid}/dispose", cookie=cookie,
+                   body={"action": "CLOSED_MISSED"})
+    bad(f"原时限仍有效时人工定 MISSED → HTTP {st}")
+
+    # 合法签名账簿补记事实（重复两次上传演示幂等）
+    good = d10.build_ledger_entry(c10["command_id"], "EXECUTED", "actuated",
+                                  d10.boot_code, 1, c10["digest"])
+    st, h2 = devpost("/api/device/hello", "DEV-A2",
+                     {"boot_code": d10.boot_code, "first_seq": 1,
+                      "ledger": [good, good]})
+    ok(f"签名账簿校验通过：补记 {h2['ledger']['recovered']} 条，"
+       f"幂等重复 {h2['ledger']['duplicates']} 条")
+    st, td = call("GET", f"{SEC}/api/tickets/{tid}", cookie=cookie)
+    ok(f"工单结案 {td['status']}/{td['resolution']}，处置历史 "
+       f"{[a['action'] for a in td['history']]}")
+    st, out = call("POST", f"{SEC}/api/tickets/{tid}/dispose", cookie=cookie,
+                   body={"action": "APPROVE_REDELIVER"})
+    bad(f"事实确认后试图人工重投 → HTTP {st}（执行事实不可覆盖）")
+
+    # ---------------- 9 审计链 ----------------
+    hr("9. 设备回执审计与哈希链")
     st, audit = call("GET", SEC + "/api/audit?limit=300", cookie=cookie)
     n = audit["chain"]["events"]
     ok(f"审计事件 {n} 条，哈希链校验={audit['chain']['ok']}，链尾 {audit['chain']['head'][:16]}…")
