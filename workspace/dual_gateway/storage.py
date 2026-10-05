@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS receipts (
     source      TEXT NOT NULL,
     event_id    INTEGER NOT NULL,
     received_at REAL NOT NULL,
+    entry_hash  TEXT,
+    prev_hash   TEXT,
     UNIQUE (command_id, device_id)
 );
 
@@ -94,6 +96,62 @@ CREATE TABLE IF NOT EXISTS rejected_receipts (
     reason      TEXT NOT NULL,
     raw         TEXT NOT NULL,
     received_at REAL NOT NULL
+);
+
+-- 事故恢复对账工单：每个“已送达现场但缺少终态回报”的目标一张，唯一不重复
+CREATE TABLE IF NOT EXISTS incidents (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id     TEXT NOT NULL UNIQUE,
+    command_id      TEXT NOT NULL,
+    device_id       TEXT NOT NULL,
+    status          TEXT NOT NULL,          -- OPEN/RECOVERED/REDELIVERED/EXPIRED
+    open_reason     TEXT NOT NULL,
+    dispatched_boot TEXT,
+    opened_at       REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    resolved_at     REAL,
+    resolution      TEXT
+);
+
+-- 同一目标同时至多一张未结工单；历史上可有多张（重新派发后可能再次悬置）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_open_unique
+    ON incidents(command_id, device_id) WHERE status='OPEN';
+
+-- 工单处置历史（证据采信 / 隔离 / 自动与人工处置 / 备注），只追加
+CREATE TABLE IF NOT EXISTS incident_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    actor       TEXT NOT NULL,             -- system / device_id / 安全员账号
+    kind        TEXT NOT NULL,
+    detail      TEXT NOT NULL,             -- JSON
+    audit_event_id INTEGER
+);
+
+-- 账簿隔离区：编号缺口、矛盾记录、过期时限、旧代次材料、坏签名全部留痕
+CREATE TABLE IF NOT EXISTS quarantined_ledger (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id    TEXT NOT NULL,
+    boot_code    TEXT,
+    seq          INTEGER,
+    command_id   TEXT,
+    reason       TEXT NOT NULL,
+    entry        TEXT NOT NULL,            -- 原始条目 JSON（坏签名时为整册 JSON 数组）
+    incident_id  TEXT,
+    upload_hash  TEXT,
+    received_at  REAL NOT NULL
+);
+
+-- 账簿上送幂等：同一设备同一册内容（canonical 哈希）只处理一次
+CREATE TABLE IF NOT EXISTS ledger_uploads (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    book_hash   TEXT NOT NULL,
+    boot_code   TEXT,
+    sig_valid   INTEGER NOT NULL,
+    entry_count INTEGER NOT NULL,
+    received_at REAL NOT NULL,
+    UNIQUE (device_id, book_hash)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -114,7 +172,16 @@ CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_receipts_device ON receipts(device_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_seq ON receipts(device_id, boot_code, seq);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
+CREATE INDEX IF NOT EXISTS idx_incidents_device ON incidents(device_id);
+CREATE INDEX IF NOT EXISTS idx_iev_incident ON incident_events(incident_id, id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_device ON quarantined_ledger(device_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_incident ON quarantined_ledger(incident_id);
 """
+
+
+def _column_names(conn, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 class Storage:
@@ -128,7 +195,16 @@ class Storage:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """旧库补列（receipts 增加账簿链式证据字段），新库已是最新。"""
+        cols = _column_names(self.conn, "receipts")
+        if "entry_hash" not in cols:
+            self.conn.execute("ALTER TABLE receipts ADD COLUMN entry_hash TEXT")
+        if "prev_hash" not in cols:
+            self.conn.execute("ALTER TABLE receipts ADD COLUMN prev_hash TEXT")
 
     def close(self):
         self.conn.close()
@@ -399,10 +475,12 @@ class Storage:
         try:
             self.conn.execute(
                 "INSERT INTO receipts(command_id,device_id,boot_code,seq,result,message,"
-                "source,event_id,received_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                "source,event_id,received_at,entry_hash,prev_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (rec["command_id"], rec["device_id"], rec["boot_code"], rec["seq"],
                  rec["result"], rec.get("message"), rec["source"],
-                 rec["event_id"], rec["received_at"]))
+                 rec["event_id"], rec["received_at"],
+                 rec.get("entry_hash"), rec.get("prev_hash")))
             return True
         except sqlite3.IntegrityError:
             return False
@@ -440,6 +518,137 @@ class Storage:
         rows = self.conn.execute(
             "SELECT * FROM rejected_receipts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- 事故恢复对账工单 ----------
+    def insert_incident(self, inc: dict, now: float) -> Optional[dict]:
+        """创建工单。同一目标已有 OPEN 工单时幂等返回既有工单。"""
+        try:
+            self.conn.execute(
+                "INSERT INTO incidents(incident_id,command_id,device_id,status,"
+                "open_reason,dispatched_boot,opened_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (inc["incident_id"], inc["command_id"], inc["device_id"], "OPEN",
+                 inc["open_reason"], inc.get("dispatched_boot"), now, now))
+            row = self.get_incident_row(inc["incident_id"])
+            return dict(row) if row else None
+        except sqlite3.IntegrityError:
+            row = self.conn.execute(
+                "SELECT * FROM incidents WHERE command_id=? AND device_id=? "
+                "AND status='OPEN'", (inc["command_id"], inc["device_id"])).fetchone()
+            return dict(row) if row else None
+
+    def get_incident_row(self, incident_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM incidents WHERE incident_id=?", (incident_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_open_incident(self, command_id: str, device_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM incidents WHERE command_id=? AND device_id=? "
+            "AND status='OPEN'", (command_id, device_id)).fetchone()
+        return dict(row) if row else None
+
+    def list_incidents(self, status: str | None = None, limit: int = 200) -> list[dict]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT * FROM incidents WHERE status=? ORDER BY id DESC LIMIT ?",
+                (status, limit)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM incidents ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_incident(self, incident_id: str, status: str,
+                         resolution: str, now: float):
+        cur = self.conn.execute(
+            "UPDATE incidents SET status=?,resolution=?,resolved_at=?,updated_at=? "
+            "WHERE incident_id=? AND status='OPEN'",
+            (status, resolution, now, now, incident_id))
+        return cur.rowcount == 1
+
+    def touch_incident(self, incident_id: str, now: float):
+        self.conn.execute(
+            "UPDATE incidents SET updated_at=? WHERE incident_id=?", (now, incident_id))
+
+    def add_incident_event(self, incident_id: str, now: float, actor: str,
+                           kind: str, detail: dict,
+                           audit_event_id: int | None = None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO incident_events(incident_id,ts,actor,kind,detail,audit_event_id)"
+            " VALUES(?,?,?,?,?,?)",
+            (incident_id, now, actor, kind,
+             json.dumps(detail, ensure_ascii=False, sort_keys=True), audit_event_id))
+        return cur.lastrowid
+
+    def list_incident_events(self, incident_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM incident_events WHERE incident_id=? ORDER BY id",
+            (incident_id,)).fetchall()
+        out = [dict(r) for r in rows]
+        for r in out:
+            r["detail"] = json.loads(r["detail"])
+        return out
+
+    # ---------- 账簿上送幂等 / 隔离区 ----------
+    def ledger_upload_seen(self, device_id: str, book_hash: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM ledger_uploads WHERE device_id=? AND book_hash=?",
+            (device_id, book_hash)).fetchone()
+        return dict(row) if row else None
+
+    def record_ledger_upload(self, device_id: str, book_hash: str, boot_code: str | None,
+                             sig_valid: bool, entry_count: int, now: float) -> bool:
+        try:
+            self.conn.execute(
+                "INSERT INTO ledger_uploads(device_id,book_hash,boot_code,sig_valid,"
+                "entry_count,received_at) VALUES(?,?,?,?,?,?)",
+                (device_id, book_hash, boot_code, 1 if sig_valid else 0,
+                 entry_count, now))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def insert_quarantine(self, device_id: str, reason: str, raw_entry: Any,
+                          now: float, *, boot_code: str | None = None,
+                          seq: int | None = None, command_id: str | None = None,
+                          incident_id: str | None = None,
+                          upload_hash: str | None = None) -> Optional[int]:
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO quarantined_ledger(device_id,boot_code,seq,command_id,"
+                "reason,entry,incident_id,upload_hash,received_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (device_id, boot_code, seq, command_id, reason,
+                 json.dumps(raw_entry, ensure_ascii=False, sort_keys=True),
+                 incident_id, upload_hash, now))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+    def list_quarantine(self, incident_id: str | None = None,
+                        device_id: str | None = None, limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM quarantined_ledger WHERE 1=1"
+        args: list = []
+        if incident_id:
+            sql += " AND incident_id=?"
+            args.append(incident_id)
+        if device_id:
+            sql += " AND device_id=?"
+            args.append(device_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        rows = self.conn.execute(sql, args).fetchall()
+        out = [dict(r) for r in rows]
+        for r in out:
+            r["entry"] = json.loads(r["entry"])
+        return out
+
+    def close_doubt_as_missed(self, command_id: str, device_id: str, now: float) -> bool:
+        cur = self.conn.execute(
+            "UPDATE targets SET status='MISSED',updated_at=? "
+            "WHERE command_id=? AND device_id=? AND status='DOUBT'",
+            (now, command_id, device_id))
+        return cur.rowcount == 1
 
     def commit(self):
         self.conn.commit()

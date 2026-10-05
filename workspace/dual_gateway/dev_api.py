@@ -56,7 +56,8 @@ def hello(h):
         device_id=device_id,
         boot_code=body.get("boot_code", ""),
         first_seq=int(body.get("first_seq", 1)),
-        ledger=body.get("ledger") or [])
+        ledger=body.get("ledger") or [],
+        ledger_sig=body.get("ledger_sig"))
     h.send_json(out)
 
 

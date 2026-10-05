@@ -21,7 +21,8 @@ import os
 import threading
 import time
 
-from .security import hmac_sign, new_boot_code
+from .security import (hmac_sign, ledger_anchor, ledger_entry_hash,
+                       ledger_sign, new_boot_code)
 
 try:
     import urllib.request
@@ -77,6 +78,23 @@ class SimDevice:
             os.fsync(f.fileno())
         self.executed.append(entry)
 
+    # ---------- 账簿条目：指令指纹 + prev 哈希链 ----------
+    def _prev_for(self, boot: str, seq: int) -> str:
+        """同代次上一条目哈希；代次首条接代次锚点。"""
+        for e in reversed(self.executed):
+            if e.get("boot_code") == boot and e.get("seq") == seq - 1:
+                return ledger_entry_hash(self.device_id, e)
+        return ledger_anchor(self.device_id, boot, 1)
+
+    def make_ledger_entry(self, command_id: str, result: str, digest: str,
+                          message: str = "simulated actuation",
+                          *, seq: int | None = None, boot: str | None = None) -> dict:
+        boot = boot or self.boot_code
+        seq = self.seq if seq is None else seq
+        return {"command_id": command_id, "boot_code": boot, "seq": seq,
+                "result": result, "digest": digest, "message": message,
+                "prev": self._prev_for(boot, seq)}
+
     # ---------- HTTP ----------
     def _post(self, path: str, payload: dict):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -92,11 +110,17 @@ class SimDevice:
 
     # ---------- 协议动作 ----------
     def hello(self, boot_code: str | None = None, first_seq: int = 1,
-              include_ledger: bool = True):
+              include_ledger: bool = True, *,
+              ledger_sig: str | None = None):
         payload: dict = {"boot_code": boot_code or self.boot_code,
                          "first_seq": first_seq}
         if include_ledger:
-            payload["ledger"] = self.executed
+            entries = self.executed
+            payload["ledger"] = entries
+            # 独立账簿签名（与传输 HMAC 分开，防止账簿被调包）
+            payload["ledger_sig"] = (
+                ledger_sig if ledger_sig is not None
+                else ledger_sign(self.key, entries))
         return self._post("/api/device/hello", payload)
 
     def heartbeat(self, boot_code: str | None = None):
@@ -120,9 +144,9 @@ class SimDevice:
             result = "FAILED" if random.random() < self.fail_rate else "EXECUTED"
             seq = self.seq
             boot = self.boot_code
-            entry = {"command_id": cmd["command_id"], "boot_code": boot,
-                     "seq": seq, "result": result,
-                     "message": "simulated actuation"}
+            entry = self.make_ledger_entry(
+                cmd["command_id"], result, cmd.get("digest", ""),
+                "simulated actuation", seq=seq, boot=boot)
             # 1) 执行事实先持久化（关键：先落盘后回执）
             self._append_ledger(entry)
             self.seq += 1

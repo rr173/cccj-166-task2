@@ -58,6 +58,9 @@ th{{color:#8fa3c6;font-weight:600}} code,.mono{{font-family:ui-monospace,Menlo,C
 .EXPIRED,.REVOKED,.REJECTED,.CLOSED{{background:#333845;color:#aab2c5}}
 .DISPATCHED{{background:#10304a;color:#7fc4ff}} .DOUBT{{background:#4a2c10;color:#ffbd7f}}
 .MISSED,.SKIPPED{{background:#2a2f3c;color:#9aa3b5}}
+.OPEN{{background:#4a2c10;color:#ffbd7f}} .RECOVERED{{background:#103a20;color:#7ff0ac}}
+.REDELIVERED{{background:#10304a;color:#7fc4ff}} .EXPIRED{{background:#333845;color:#aab2c5}}
+.qreason{{background:#3d1620;color:#ff8ea3;padding:1px 8px;border-radius:10px;font-size:12px}}
 input,textarea,select{{background:#0f1626;border:1px solid #31405f;color:#e6e9ef;border-radius:6px;padding:8px;margin:4px 0;width:320px}}
 button{{background:#2f6df6;color:#fff;border:0;border-radius:6px;padding:9px 18px;cursor:pointer;margin-right:8px}}
 button.danger{{background:#c0394f}} button.gray{{background:#3a4358}}
@@ -65,7 +68,9 @@ button.danger{{background:#c0394f}} button.gray{{background:#3a4358}}
 .ok{{background:#103a20;color:#7ff0ac}} .muted{{color:#8593ad;font-size:12px}}
 </style></head><body><header>
 <b>🛡 安全确认工作台</b>
-<a href="/workbench">待确认/在途指令</a><a href="/audit">审计事件链</a>
+<a href="/workbench">待确认/在途指令</a><a href="/incidents">事故对账工单</a>
+<a href="/quarantine">账簿隔离区</a>
+<a href="/audit">审计事件链</a>
 <a href="/receipts">回执审计</a><a href="/devices">设备状态</a>
 <span style="flex:1"></span><span class="muted">{user}</span>
 <a href="/logout">登出</a></header><main>{flash}{body}</main></body></html>"""
@@ -234,6 +239,189 @@ def web_reject(h):
     h.redirect(f"/commands/{cid}")
 
 
+# ---------------- 事故恢复对账工单 ----------------
+@route("/incidents", "GET")
+def incidents_page(h):
+    _check_login(h)
+    q = h.query()
+    status = q.get("status") or "OPEN"
+    incs = h.ctx.svc.list_incidents(status=None if status == "ALL" else status)
+    n_open = len(h.ctx.svc.list_incidents(status="OPEN"))
+    rows = []
+    for i in incs:
+        rows.append(
+            f'<tr><td class="mono"><a href="/incidents/{i["incident_id"]}" '
+            f'style="color:#9db4d8">{i["incident_id"]}</a></td>'
+            f'<td class="mono">{i["command_id"]}</td><td>{i["device_id"]}</td>'
+            f'<td>{html.escape(i.get("action") or "—")}</td>'
+            f'<td><span class="tag {i["status"]}">{i["status"]}</span></td>'
+            f'<td><span class="tag {i.get("target_status") or ""}">'
+            f'{i.get("target_status") or "—"}</span></td>'
+            f'<td>{i["open_reason"]}</td>'
+            f'<td class="muted">{_ts(i["opened_at"])}</td></tr>')
+    tabs = "".join(
+        f'<a href="/incidents?status={s}" style="margin-right:12px">'
+        f'<b>{s}</b></a>' for s in ("OPEN", "RECOVERED", "REDELIVERED",
+                                    "EXPIRED", "ALL"))
+    body = f"""<div class="card"><h3>事故恢复对账工单（仅安全通道可见）
+    <span class="tag OPEN">未结 {n_open}</span></h3>
+    <p class="muted">{tabs}</p>
+    <table><tr><th>工单</th><th>指令</th><th>设备</th><th>动作</th>
+    <th>工单状态</th><th>目标状态</th><th>打开原因</th><th>打开时间</th></tr>
+    {''.join(rows) or '<tr><td colspan=8 class=muted>暂无工单</td></tr>'}
+    </table></div>"""
+    _page(h, "事故对账工单", body)
+
+
+@route("/incidents/*", "GET")
+def incident_detail_page(h):
+    s = _check_login(h)
+    iid = h.raw_path.rsplit("/", 1)[-1]
+    i = h.ctx.svc.incident_detail(iid)
+    c = i["command"]
+    t = i["target"]
+    rec = ""
+    if t.get("receipt"):
+        r = t["receipt"]
+        rec = (f'<b>{r["result"]}</b> <span class="muted">代号 {r["boot_code"]} '
+               f'#{r["seq"]} / 来源 {r["source"]}</span>')
+
+    hist_rows = []
+    for ev in i["history"]:
+        hist_rows.append(
+            f'<tr><td class="mono">{_ts(ev["ts"])}</td><td>{html.escape(ev["actor"])}'
+            f'</td><td><b>{ev["kind"]}</b></td>'
+            f'<td class="mono">{html.escape(str(ev["detail"]))[:400]}</td></tr>')
+
+    q_rows = []
+    for q in i["quarantine"]:
+        q_rows.append(
+            f'<tr><td><span class="qreason">{q["reason"]}</span></td>'
+            f'<td>{q.get("boot_code") or "—"}</td><td>{q.get("seq") if q.get("seq") is not None else "—"}</td>'
+            f'<td class="mono">{html.escape(str(q["entry"]))[:300]}</td></tr>')
+
+    action_box = ""
+    if i["status"] == "OPEN" and s["user"] == "supervisor":
+        if t["status"] == "DOUBT" and i["window_open"]:
+            action_box = f"""
+            <div class="card"><h3>人工处置（不会覆盖任何执行事实）</h3>
+            <form method="post" action="/incidents/{iid}/redeliver"
+                  onsubmit="return confirm('确认设备确定未执行且已更换启动代号？重投可能双触发。')">
+              <input name="reason" placeholder="重新派发依据（带外核实说明）" style="width:420px">
+              <button type="submit">↻ 确认未执行且时限有效，重新派发</button>
+            </form>
+            <p class="muted">仅当设备已换代号（确定重启过）、窗口仍有效且无执行证据时允许。</p>
+            </div>"""
+        elif t["status"] == "DOUBT" and not i["window_open"]:
+            action_box = f"""
+            <div class="card"><h3>人工处置（不会覆盖任何执行事实）</h3>
+            <form method="post" action="/incidents/{iid}/close"
+                  onsubmit="return confirm('窗口已关闭，按未达 MISSED 关闭工单？不产生执行事实。')">
+              <input name="reason" placeholder="关闭依据（始终无法取得账簿证据）" style="width:420px">
+              <button class="gray" type="submit">🔒 窗口已过且无证据，按未达关闭</button>
+            </form></div>"""
+        else:
+            action_box = '<div class="card muted">目标当前不处于 DOUBT，暂无可处置动作</div>'
+        action_box += f"""
+        <div class="card"><h3>添加处置备注</h3>
+        <form method="post" action="/incidents/{iid}/note">
+          <input name="note" placeholder="备注（留痕，不改状态）" style="width:520px">
+          <button class="gray" type="submit">追加备注</button>
+        </form></div>"""
+    elif i["status"] == "OPEN":
+        action_box = '<div class="card muted">只读账号：仅 supervisor 可处置</div>'
+
+    body = f"""<div class="card">
+      <h3>对账工单 {i["incident_id"]}
+      <span class="tag {i["status"]}">{i["status"]}</span></h3>
+      <table>
+      <tr><th>指令 / 动作</th><td class="mono">{i["command_id"]} / {html.escape(c["action"] if c else "—")}</td></tr>
+      <tr><th>现场设备</th><td>{i["device_id"]}（投递代次 <span class="mono">{i["dispatched_boot"]}</span>）</td></tr>
+      <tr><th>打开原因 / 时间</th><td>{i["open_reason"]} / {_ts(i["opened_at"])}</td></tr>
+      <tr><th>冻结指令指纹</th><td><span class="digest mono">{c["digest"] if c else "—"}</span></td></tr>
+      <tr><th>目标状态</th><td><span class="tag {t["status"]}">{t["status"]}</span> {rec}</td></tr>
+      <tr><th>有效窗口</th><td class="mono">{_ts(c["valid_from"] if c else None)} → {_ts(c["valid_to"] if c else None)}
+      （{'仍有效' if i["window_open"] else '已过期'}）</td></tr>
+      <tr><th>结论</th><td>{html.escape(str(i.get("resolution")))} / {_ts(i.get("resolved_at"))}</td></tr>
+      </table></div>
+      {action_box}
+      <div class="card"><h3>证据 / 冲突 / 处置历史（只追加）</h3>
+      <table><tr><th>时间</th><th>主体</th><th>事件</th><th>内容</th></tr>
+      {''.join(hist_rows) or '<tr><td colspan=4 class=muted>暂无</td></tr>'}</table></div>
+      <div class="card"><h3>隔离留痕（编号缺口/矛盾/过期/旧代次/坏签名）</h3>
+      <table><tr><th>原因</th><th>代次</th><th>序号</th><th>原始材料</th></tr>
+      {''.join(q_rows) or '<tr><td colspan=4 class=muted>无隔离材料</td></tr>'}</table></div>"""
+    _page(h, iid, body)
+
+
+def _incident_form(h):
+    from urllib.parse import parse_qs
+    form = parse_qs(h._body().decode("utf-8"))
+    return (form.get("reason") or [""])[0], (form.get("note") or [""])[0]
+
+
+@route("/incidents/*/redeliver", "POST")
+def web_incident_redeliver(h):
+    s = _require_role(h, "supervisor")
+    iid = h.raw_path.split("/")[2]
+    reason, _ = _incident_form(h)
+    try:
+        h.ctx.svc.incident_redeliver(s["user"], iid, reason)
+        h.redirect(f"/incidents/{iid}")
+    except Exception as exc:
+        _page(h, iid, f'<div class="flash">{html.escape(str(exc))}</div>'
+                      f'<p><a href="/incidents/{iid}">返回工单</a></p>',
+              status=getattr(exc, "http_status", 400))
+
+
+@route("/incidents/*/close", "POST")
+def web_incident_close(h):
+    s = _require_role(h, "supervisor")
+    iid = h.raw_path.split("/")[2]
+    reason, _ = _incident_form(h)
+    try:
+        h.ctx.svc.incident_close_unverified(s["user"], iid, reason)
+        h.redirect(f"/incidents/{iid}")
+    except Exception as exc:
+        _page(h, iid, f'<div class="flash">{html.escape(str(exc))}</div>'
+                      f'<p><a href="/incidents/{iid}">返回工单</a></p>',
+              status=getattr(exc, "http_status", 400))
+
+
+@route("/incidents/*/note", "POST")
+def web_incident_note(h):
+    s = _require_role(h, "supervisor")
+    iid = h.raw_path.split("/")[2]
+    _, note = _incident_form(h)
+    try:
+        h.ctx.svc.incident_note(s["user"], iid, note)
+        h.redirect(f"/incidents/{iid}")
+    except Exception as exc:
+        _page(h, iid, f'<div class="flash">{html.escape(str(exc))}</div>'
+                      f'<p><a href="/incidents/{iid}">返回工单</a></p>',
+              status=getattr(exc, "http_status", 400))
+
+
+@route("/quarantine", "GET")
+def quarantine_page(h):
+    _check_login(h)
+    rows = []
+    for q in h.ctx.svc.list_quarantine():
+        rows.append(
+            f'<tr><td>{q["id"]}</td><td>{q["device_id"]}</td>'
+            f'<td><span class="qreason">{q["reason"]}</span></td>'
+            f'<td class="mono">{q.get("boot_code") or "—"}</td>'
+            f'<td>{q.get("seq") if q.get("seq") is not None else "—"}</td>'
+            f'<td class="mono">{q.get("command_id") or "—"}</td>'
+            f'<td class="mono">{html.escape(str(q["entry"]))[:260]}</td>'
+            f'<td class="muted">{_ts(q["received_at"])}</td></tr>')
+    body = """<div class="card"><h3>账簿隔离区（只留痕，绝不据此改状态/造事实）</h3>
+    <table><tr><th>#</th><th>设备</th><th>原因</th><th>代次</th><th>序号</th>
+    <th>指令</th><th>原始材料</th><th>时间</th></tr>
+    """ + "".join(rows) + "</table></div>"
+    _page(h, "账簿隔离区", body)
+
+
 # ---------------- 审计 ----------------
 @route("/audit", "GET")
 def audit_page(h):
@@ -373,6 +561,54 @@ def api_audit(h):
 def api_rejected(h):
     _check_login(h)
     h.send_json({"rejected": h.ctx.svc.rejected_receipts()})
+
+
+@route("/api/incidents", "GET")
+def api_incidents(h):
+    _check_login(h)
+    q = h.query()
+    status = q.get("status")
+    h.send_json({"incidents": h.ctx.svc.list_incidents(
+        status=None if status in (None, "ALL") else status)})
+
+
+@route("/api/incidents/*", "GET")
+def api_incident_detail(h):
+    _check_login(h)
+    iid = h.raw_path.rsplit("/", 1)[-1]
+    h.send_json(h.ctx.svc.incident_detail(iid))
+
+
+@route("/api/incidents/*/redeliver", "POST")
+def api_incident_redeliver(h):
+    s = _require_role(h, "supervisor")
+    iid = h.raw_path.split("/")[3]
+    body = h.read_json()
+    h.send_json(h.ctx.svc.incident_redeliver(
+        s["user"], iid, body.get("reason", "")))
+
+
+@route("/api/incidents/*/close", "POST")
+def api_incident_close(h):
+    s = _require_role(h, "supervisor")
+    iid = h.raw_path.split("/")[3]
+    body = h.read_json()
+    h.send_json(h.ctx.svc.incident_close_unverified(
+        s["user"], iid, body.get("reason", "")))
+
+
+@route("/api/incidents/*/note", "POST")
+def api_incident_note(h):
+    s = _require_role(h, "supervisor")
+    iid = h.raw_path.split("/")[3]
+    body = h.read_json()
+    h.send_json(h.ctx.svc.incident_note(s["user"], iid, body.get("note", "")))
+
+
+@route("/api/quarantine", "GET")
+def api_quarantine(h):
+    _check_login(h)
+    h.send_json({"quarantined": h.ctx.svc.list_quarantine()})
 
 
 @route("/healthz", "GET")

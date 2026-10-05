@@ -24,7 +24,8 @@ import urllib.request
 from dual_gateway.app import Gateway
 from dual_gateway.config import load_config
 from dual_gateway.device_sim import SimDevice
-from dual_gateway.security import hmac_sign
+from dual_gateway.security import (hmac_sign, ledger_anchor, ledger_entry_hash,
+                                   ledger_sign)
 
 
 def _req(method: str, url: str, *, token=None, cookie=None, body=None,
@@ -123,6 +124,23 @@ class E2EBase(unittest.TestCase):
         d = SimDevice(dev_id, self.cfg.device_keys[dev_id], self.dev,
                       os.path.join(self.tmp, state_subdir), verbose=False, **kw)
         return d
+
+    # ---- 构造带指纹 + prev 哈希链的签名账簿条目 ----
+    def ledger_entry(self, dev_id, cid, digest, boot, seq, *, result="EXECUTED",
+                     message="done", prev=None):
+        e = {"command_id": cid, "boot_code": boot, "seq": seq, "result": result,
+             "digest": digest, "message": message,
+             "prev": prev if prev is not None else ledger_anchor(dev_id, boot, 1)}
+        return e
+
+    def ledger_sig(self, dev_id, entries):
+        return ledger_sign(self.cfg.device_keys[dev_id], entries)
+
+    def hello_ledger(self, dev_id, boot, entries, first_seq=1, *, sig=None):
+        return self.devcall("/api/device/hello", dev_id, {
+            "boot_code": boot, "first_seq": first_seq, "ledger": entries,
+            "ledger_sig": sig if sig is not None
+                          else self.ledger_sig(dev_id, entries)})
 
 
 class TestHappyPath(E2EBase):
@@ -315,30 +333,47 @@ class TestGatewayRestart(E2EBase):
                      {"boot_code": d.boot_code, "first_seq": 1})
         self.devcall("/api/device/pull", "DEV-A1", {"boot_code": d.boot_code})
 
-        # 设备执行了，但在回执送达前网关崩溃
-        d._append_ledger({"command_id": c["command_id"],
-                          "boot_code": d.boot_code, "seq": 1,
-                          "result": "EXECUTED", "message": "done"})
+        # 设备执行了，但在回执送达前网关崩溃（条目带指令指纹+prev 链）
+        d._append_ledger(d.make_ledger_entry(
+            c["command_id"], "EXECUTED", c["digest"], "done"))
         d.seq = 2
 
         self.restart_gateway()
-        # 在途目标重启后必须是 DOUBT
+        # 在途目标重启后必须是 DOUBT，且生成对账工单（仅安全通道可见）
         st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
                              token=self.cfg.biz_token)
         self.assertEqual(detail["targets"][0]["status"], "DOUBT")
+        # 业务通道根本没有工单路由
+        st, _, _ = _req("GET", self.biz + "/api/incidents",
+                        token=self.cfg.biz_token)
+        self.assertEqual(st, 404)
+        cookie = self.sec_login()
+        st, incs, _ = _req("GET", self.sec + "/api/incidents?status=OPEN",
+                           cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(incs["incidents"]), 1)
+        iid = incs["incidents"][0]["incident_id"]
 
-        # 设备用同一代号重新 HELLO（没重启），无回执：保持 DOUBT，不重投
-        st, hello, _ = self.devcall("/api/device/hello", "DEV-A1",
-                                    {"boot_code": d.boot_code, "first_seq": 1,
-                                     "ledger": d.executed})
+        # 设备用同一代号重新 HELLO（没重启），账簿带独立签名：保持 DOUBT，不重投
+        st, hello, _ = self.devcall(
+            "/api/device/hello", "DEV-A1",
+            {"boot_code": d.boot_code, "first_seq": 1,
+             "ledger": d.executed,
+             "ledger_sig": self.ledger_sig("DEV-A1", d.executed)})
         st, pull, _ = self.devcall("/api/device/pull", "DEV-A1",
                                    {"boot_code": d.boot_code})
         self.assertEqual(pull["commands"], [])
-        # 同代号下账本条目携带了执行事实 → 直接补记
+        # 同代号下账簿条目携带了执行事实 → 直接补记
         st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
                              token=self.cfg.biz_token)
         self.assertEqual(detail["status"], "EXECUTED")
         self.assertEqual(detail["targets"][0]["receipt"]["source"], "LEDGER_RECOVERY")
+        # 工单被自动置为 RECOVERED，处置历史含证据采信
+        st, idetail, _ = _req("GET", f"{self.sec}/api/incidents/{iid}",
+                              cookie=cookie)
+        self.assertEqual(idetail["status"], "RECOVERED")
+        self.assertIn("LEDGER_EVIDENCE_ACCEPTED",
+                      {e["kind"] for e in idetail["history"]})
 
     def test_restart_device_reboot_not_executed_redeliver(self):
         c = self.create(devices=("DEV-A1",))
@@ -414,14 +449,15 @@ class TestDroppedReceipt(E2EBase):
         self.devcall("/api/device/hello", "DEV-A1",
                      {"boot_code": d.boot_code, "first_seq": 1})
         self.devcall("/api/device/pull", "DEV-A1", {"boot_code": d.boot_code})
-        # 直接执行（回执被模拟丢弃，账本已落盘）
-        cmds = [x for x in [c]]
-        d.execute_and_report({"command_id": c["command_id"]})
+        # 直接执行（回执被模拟丢弃，账簿已落盘，条目含指令指纹）
+        d.execute_and_report({"command_id": c["command_id"],
+                              "digest": c["digest"]})
         self.restart_gateway()
-        # 设备未重启，同代号 + 账本补记；不会重投，不会双触发
+        # 设备未重启，同代号 + 签名账簿补记；不会重投，不会双触发
         self.devcall("/api/device/hello", "DEV-A1",
                      {"boot_code": d.boot_code, "first_seq": 1,
-                      "ledger": d.executed})
+                      "ledger": d.executed,
+                      "ledger_sig": self.ledger_sig("DEV-A1", d.executed)})
         st, pull, _ = self.devcall("/api/device/pull", "DEV-A1",
                                    {"boot_code": d.boot_code})
         self.assertEqual(pull["commands"], [])
@@ -429,6 +465,97 @@ class TestDroppedReceipt(E2EBase):
                              token=self.cfg.biz_token)
         self.assertEqual(detail["targets"][0]["status"], "EXECUTED")
         self.assertEqual(detail["targets"][0]["receipt"]["source"], "LEDGER_RECOVERY")
+
+
+class TestIncidentWorkbench(E2EBase):
+    def _doubt(self, valid_seconds=None, dev="DEV-A1"):
+        c = self.create(devices=(dev,), valid_seconds=valid_seconds)
+        cookie = self.sec_login()
+        self.confirm(c, cookie)
+        boot = f"BOOT-{dev}-1"
+        self.devcall("/api/device/hello", dev,
+                     {"boot_code": boot, "first_seq": 1})
+        self.devcall("/api/device/pull", dev, {"boot_code": boot})
+        self.restart_gateway()
+        cookie = self.sec_login()  # 重启后内存会话失效
+        return c, boot, cookie
+
+    def test_incidents_only_on_security_channel_and_safety_readonly(self):
+        c, boot, cookie = self._doubt()
+        # 安全通道可列工单
+        st, incs, _ = _req("GET", self.sec + "/api/incidents?status=OPEN",
+                           cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(incs["incidents"]), 1)
+        iid = incs["incidents"][0]["incident_id"]
+        st, detail, _ = _req("GET", f"{self.sec}/api/incidents/{iid}",
+                             cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertEqual(detail["command"]["digest"], c["digest"])
+        # 只读安全员不能处置
+        ro = self.sec_login("safety")
+        st, out, _ = _req("POST", f"{self.sec}/api/incidents/{iid}/note",
+                          cookie=ro, body={"note": "x"})
+        self.assertEqual(st, 403)
+        # 未登录被拒
+        st, _, _ = _req("GET", self.sec + "/api/incidents")
+        self.assertEqual(st, 401)
+
+    def test_bad_ledger_signature_quarantines_and_no_redeliver(self):
+        c, boot, cookie = self._doubt()
+        # 设备换代号重连，账簿签名错误：整册隔离，目标保持 DOUBT，不重投
+        e = self.ledger_entry("DEV-A1", c["command_id"], c["digest"], boot, 1)
+        st, hello, _ = self.hello_ledger(
+            "DEV-A1", "BOOT-DEV-A1-2", [e], sig="0" * 64)
+        self.assertEqual(st, 200)
+        self.assertFalse(hello["ledger"]["sig_valid"])
+        st, pull, _ = self.devcall("/api/device/pull", "DEV-A1",
+                                   {"boot_code": "BOOT-DEV-A1-2"})
+        self.assertEqual(pull["commands"], [])
+        st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
+                             token=self.cfg.biz_token)
+        self.assertEqual(detail["targets"][0]["status"], "DOUBT")
+        st, q, _ = _req("GET", self.sec + "/api/quarantine", cookie=cookie)
+        self.assertTrue(any(x["reason"] == "LEDGER_BAD_SIGNATURE"
+                            for x in q["quarantined"]))
+
+    def test_duplicate_ledger_upload_idempotent_e2e(self):
+        c, boot, cookie = self._doubt()
+        e = self.ledger_entry("DEV-A1", c["command_id"], c["digest"], boot, 1)
+        payload = {"boot_code": boot, "first_seq": 1, "ledger": [e]}
+        self.hello_ledger("DEV-A1", boot, [e])
+        # 完全相同的册再次上送
+        st, hello2, _ = self.hello_ledger("DEV-A1", boot, [e])
+        self.assertTrue(hello2["ledger"]["duplicate"])
+        st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
+                             token=self.cfg.biz_token)
+        self.assertEqual(len(detail["targets"][0]["receipt"] and [1]), 1)
+
+    def test_manual_close_after_window_does_not_create_fact(self):
+        c, boot, cookie = self._doubt(valid_seconds=3)
+        st, incs, _ = _req("GET", self.sec + "/api/incidents?status=OPEN",
+                           cookie=cookie)
+        iid = incs["incidents"][0]["incident_id"]
+        # 窗口仍有效：禁止关闭
+        st, out, _ = _req("POST", f"{self.sec}/api/incidents/{iid}/close",
+                          cookie=cookie, body={"reason": "提前关闭"})
+        self.assertEqual(st, 409)
+        # 等待窗口真正过期
+        time.sleep(3.4)
+        # 设备换代次但空账簿：保持 DOUBT
+        self.hello_ledger("DEV-A1", "BOOT-DEV-A1-2", [])
+        st, out, _ = _req("POST", f"{self.sec}/api/incidents/{iid}/close",
+                          cookie=cookie, body={"reason": "现场确认未动作"})
+        self.assertEqual(st, 200, out)
+        self.assertEqual(out["status"], "EXPIRED")
+        self.assertEqual(out["target"]["status"], "MISSED")
+        self.assertIsNone(out["target"]["receipt"])
+        # 事后再带“执行”账簿也只能隔离，不能翻案
+        e = self.ledger_entry("DEV-A1", c["command_id"], c["digest"], boot, 1)
+        self.hello_ledger("DEV-A1", "BOOT-DEV-A1-3", [e])
+        st, detail, _ = _req("GET", f"{self.biz}/api/commands/{c['command_id']}",
+                             token=self.cfg.biz_token)
+        self.assertEqual(detail["targets"][0]["status"], "MISSED")
 
 
 if __name__ == "__main__":

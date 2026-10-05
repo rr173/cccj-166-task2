@@ -8,9 +8,11 @@
   3. 撤销安全：未确认可撤、在途拒撤、已执行不可撤销
   4. 确认超时自动冻结，冻结后绝不能再下发
   5. 旧启动代号 / 跳号 / 序号复用回执全部拒绝留痕，不改当前状态
-  6. 回执丢失 + 网关重启：在途转 DOUBT，设备账本补记执行事实、不重投
-  7. 设备未执行即重启：窗口内安全重投一次；窗口外 MISSED 不补发
-  8. 审计哈希链校验（含篡改检测）
+  6. 回执丢失 + 网关重启：在途转 DOUBT 并生成对账工单，设备签名账簿补记执行事实、不重投
+  7. 设备未执行即重启：窗口内安全重投一次；窗口外不补发、转人工处置
+  8. 事故对账：坏签名/旧代次/编号缺口/指纹不符/矛盾记录全部隔离留痕；
+     重复上送幂等；人工处置不能覆盖已确认执行事实
+  9. 审计哈希链校验（含篡改检测）
 """
 from __future__ import annotations
 
@@ -142,8 +144,8 @@ def main():
                 {"boot_code": d.boot_code, "first_seq": 1})
         st, pull = devpost("/api/device/pull", dev_id, {"boot_code": d.boot_code})
         info(f"{dev_id} 拉取到 {len(pull['commands'])} 条指令，执行中…")
-        d._append_ledger({"command_id": c["command_id"], "boot_code": d.boot_code,
-                          "seq": 1, "result": "EXECUTED", "message": "valve closed"})
+        d._append_ledger(d.make_ledger_entry(
+            c["command_id"], "EXECUTED", c["digest"], "valve closed"))
         st, resp = report(dev_id, d, c["command_id"])
         d.seq = 2
         ok(f"{dev_id} 回执 boot={d.boot_code[:12]}… seq=1 接受={resp['accepted']}")
@@ -234,15 +236,15 @@ def main():
     ok(f"拒绝回执全部留痕：{reasons}")
 
     # ---------------- 6 网关重启 + 回执丢失 ----------------
-    hr("6. 网关重启 / 回执丢失：DOUBT + 账本补记，绝不误执行")
+    hr("6. 网关重启 / 回执丢失：DOUBT + 对账工单 + 签名账簿补记，绝不误执行")
     c7 = create(["DEV-A2"], action="EMERGENCY_STOP")
     confirm(c7, cookie)
     d7 = make_dev("DEV-A2")
     devpost("/api/device/hello", "DEV-A2",
             {"boot_code": d7.boot_code, "first_seq": 1})
     devpost("/api/device/pull", "DEV-A2", {"boot_code": d7.boot_code})
-    d7._append_ledger({"command_id": c7["command_id"], "boot_code": d7.boot_code,
-                       "seq": 1, "result": "EXECUTED", "message": "done"})
+    d7._append_ledger(d7.make_ledger_entry(
+        c7["command_id"], "EXECUTED", c7["digest"], "done"))
     d7.seq = 2
     info("设备已执行并落盘，但回执在途时网关崩溃（不重放任何乐观状态）…")
     gw.stop()
@@ -256,13 +258,22 @@ def main():
     time.sleep(0.4)
     cookie = login()  # 重启后内存会话失效（安全设计），第二角色需重新登录
     t = detail(c7)["targets"][0]
-    ok(f"重启后在途目标状态={t['status']}（等待设备账本对账，禁止重投）")
+    ok(f"重启后在途目标状态={t['status']}（等待设备账簿对账，禁止重投）")
+    st, incs = call("GET", SEC + "/api/incidents?status=OPEN", cookie=cookie)
+    iid7 = incs["incidents"][0]["incident_id"]
+    ok(f"已为缺终态目标生成安全通道对账工单 {iid7}（业务通道看不到）")
+    from dual_gateway.security import ledger_sign
+    sig7 = ledger_sign(cfg.device_keys["DEV-A2"], d7.executed)
     devpost("/api/device/hello", "DEV-A2",
-            {"boot_code": d7.boot_code, "first_seq": 1, "ledger": d7.executed})
+            {"boot_code": d7.boot_code, "first_seq": 1,
+             "ledger": d7.executed, "ledger_sig": sig7})
     st, pull = devpost("/api/device/pull", "DEV-A2", {"boot_code": d7.boot_code})
     ok(f"对账后设备拉取 {len(pull['commands'])} 条（已执行的指令不会被重投/双触发）")
     t = detail(c7)["targets"][0]
-    ok(f"事实被账本补记：状态={t['status']}，回执来源={t['receipt']['source']}")
+    ok(f"事实被账簿补记：状态={t['status']}，回执来源={t['receipt']['source']}")
+    st, idet = call("GET", f"{SEC}/api/incidents/{iid7}", cookie=cookie)
+    ok(f"工单自动结案：{idet['status']}，处置历史 "
+       f"{[e['kind'] for e in idet['history']]}")
 
     # ---------------- 7 设备重启未执行 ----------------
     hr("7. 设备离线恢复：未执行才重投，窗口外 MISSED")
@@ -291,13 +302,91 @@ def main():
     t = detail(c9)["targets"][0]
     ok(f"窗口已过：目标={t['status']}，设备恢复后也拿不到指令（未执行→永不误执行）")
 
-    # ---------------- 8 审计链 ----------------
-    hr("8. 设备回执审计与哈希链")
-    st, audit = call("GET", SEC + "/api/audit?limit=300", cookie=cookie)
+    # ---------------- 8 事故对账：坏签名/指纹/缺口/幂等/人工处置 ----------------
+    hr("8. 事故恢复对账：签名账簿五重校验 + 工单隔离留痕")
+    from dual_gateway.security import (ledger_anchor, ledger_entry_hash,
+                                       ledger_sign as _lsign)
+
+    def signed_entry(dev_id, c, boot, seq, *, digest=None, result="EXECUTED",
+                     prev=None, message="actuated"):
+        e = {"command_id": c["command_id"], "boot_code": boot, "seq": seq,
+             "result": result, "digest": digest if digest is not None else c["digest"],
+             "message": message,
+             "prev": prev if prev is not None else ledger_anchor(dev_id, boot, 1)}
+        return e
+
+    # 8a) 坏签名：整册隔离、不补记、fail-closed 不重投
+    ca = create(["DEV-A1"], action="EMERGENCY_STOP")
+    confirm(ca, cookie)
+    ba = newboot()
+    devpost("/api/device/hello", "DEV-A1", {"boot_code": ba, "first_seq": 1})
+    devpost("/api/device/pull", "DEV-A1", {"boot_code": ba})
+    gw.stop(); time.sleep(0.2); gw = Gateway(cfg2); gw.start(); time.sleep(0.3)
+    cookie = login()
+    ea = signed_entry("DEV-A1", ca, ba, 1)
+    st, hb = devpost("/api/device/hello", "DEV-A1",
+                     {"boot_code": newboot(), "first_seq": 1,
+                      "ledger": [ea], "ledger_sig": "0" * 64})
+    ok(f"账簿签名无效 → sig_valid={hb['ledger']['sig_valid']}，"
+       f"隔离 {len(hb['ledger']['quarantined'])} 条，目标不动、不重投")
+
+    # 8b) 指令指纹被调包：隔离
+    cb = create(["DEV-A2"], action="EMERGENCY_STOP")
+    confirm(cb, cookie)
+    bb = newboot()
+    devpost("/api/device/hello", "DEV-A2", {"boot_code": bb, "first_seq": 1})
+    devpost("/api/device/pull", "DEV-A2", {"boot_code": bb})
+    gw.stop(); time.sleep(0.2); gw = Gateway(cfg2); gw.start(); time.sleep(0.3)
+    cookie = login()
+    eb = signed_entry("DEV-A2", cb, bb, 1, digest="f" * 64)
+    st, hb = devpost("/api/device/hello", "DEV-A2",
+                     {"boot_code": newboot(), "first_seq": 1,
+                      "ledger": [eb],
+                      "ledger_sig": _lsign(cfg.device_keys["DEV-A2"], [eb])})
+    reasons = {x["reason"] for x in hb["ledger"]["quarantined"]}
+    bad(f"账簿指令指纹与冻结摘要不符 → {reasons}（只隔离，状态不变）")
+
+    # 8c) 编号缺口 + 重复上送幂等：合法补记一次，重复不双记
+    cc = create(["DEV-B1"], action="OPEN_BYPASS")
+    confirm(cc, cookie)
+    bc = newboot()
+    devpost("/api/device/hello", "DEV-B1", {"boot_code": bc, "first_seq": 1})
+    devpost("/api/device/pull", "DEV-B1", {"boot_code": bc})
+    gw.stop(); time.sleep(0.2); gw = Gateway(cfg2); gw.start(); time.sleep(0.3)
+    cookie = login()
+    # 先送一个有缺口的册子（seq=2 直接出现）→ 隔离，不补记
+    gap = signed_entry("DEV-B1", cc, bc, 2)
+    st, hb = devpost("/api/device/hello", "DEV-B1",
+                     {"boot_code": newboot(), "first_seq": 1,
+                      "ledger": [gap],
+                      "ledger_sig": _lsign(cfg.device_keys["DEV-B1"], [gap])})
+    bad(f"编号缺口 seq=2 → { {x['reason'] for x in hb['ledger']['quarantined']} }")
+    # 同代号重连并补上正确链（seq=1 接锚点）→ 补记
+    good = signed_entry("DEV-B1", cc, bc, 1)
+    st, hb1 = devpost("/api/device/hello", "DEV-B1",
+                      {"boot_code": bc, "first_seq": 1, "ledger": [good],
+                       "ledger_sig": _lsign(cfg.device_keys["DEV-B1"], [good])})
+    ok(f"合法签名账簿补记：accepted={hb1['ledger']['accepted']}")
+    st, hb2 = devpost("/api/device/hello", "DEV-B1",
+                      {"boot_code": bc, "first_seq": 1, "ledger": [good],
+                       "ledger_sig": _lsign(cfg.device_keys["DEV-B1"], [good])})
+    ok(f"同册重复上送幂等：duplicate={hb2['ledger']['duplicate']}，"
+       f"accepted={hb2['ledger']['accepted']}，不产生第二条事实")
+    t = detail(cc)["targets"][0]
+    ok(f"目标终态={t['status']}（人工/矛盾材料都无法再覆盖）")
+
+    st, qall = call("GET", SEC + "/api/quarantine", cookie=cookie)
+    ok(f"隔离区共 {len(qall['quarantined'])} 条问题材料（坏签名/指纹/缺口全程留痕）")
+
+    # ---------------- 9 审计链 ----------------
+    hr("9. 设备回执审计与哈希链")
+    st, audit = call("GET", SEC + "/api/audit?limit=400", cookie=cookie)
     n = audit["chain"]["events"]
     ok(f"审计事件 {n} 条，哈希链校验={audit['chain']['ok']}，链尾 {audit['chain']['head'][:16]}…")
     st, rej = call("GET", SEC + "/api/rejected", cookie=cookie)
     ok(f"被拒绝回执留痕 {len(rej['rejected'])} 条（旧代号/跳号/复用/伪造可逐条追溯）")
+    st, incs = call("GET", SEC + "/api/incidents?status=ALL", cookie=cookie)
+    ok(f"对账工单 {len(incs['incidents'])} 张，工作台 /incidents 查看证据/冲突/处置历史")
     info("工作台: http://127.0.0.1:8081/login  (supervisor / S@fety-Confirm-7)")
 
     gw.stop()
